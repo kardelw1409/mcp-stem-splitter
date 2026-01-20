@@ -1,0 +1,13 @@
+[project]
+name = "mcp-stem-splitter"
+version = "0.1.0"
+description = "MCP server for stem splitting (drums/bass/vocals/other) using headless separation."
+requires-python = ">=3.11"
+dependencies = [
+  "mcp>=1.0.0",
+  "demucs>=4.0.0",
+  "soundfile>=0.12.1",
+]
+
+[project.scripts]
+mcp-stem-splitter = "mcp_stem_splitter.__main__:main"
