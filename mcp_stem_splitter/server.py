@@ -252,8 +252,30 @@ def _download_ffmpeg_essentials(local_bin: Path) -> None:
     except Exception:
         pass
 
-@mcp.tool()
+@mcp.tool("split_stems")
 def split_stems(
+    input_path: str,
+    output_dir: str,
+    model: str = "mdx_extra",
+    stems: str = "4stems",
+    audio_format: str = "wav",
+    keep_intermediates: bool = False,
+    filename_mode: str = "fixed",
+    device: str = "auto",
+) -> dict[str, Any]:
+    return split_stems_core(
+        input_path=input_path,
+        output_dir=output_dir,
+        model=model,
+        stems=stems,
+        audio_format=audio_format,
+        keep_intermediates=keep_intermediates,
+        filename_mode=filename_mode,
+        device=device,
+    )
+
+
+def split_stems_core(
     input_path: str,
     output_dir: str,
     model: str = "mdx_extra",
@@ -306,8 +328,12 @@ def split_stems(
     }
 
 
-@mcp.tool()
+@mcp.tool("list_models")
 def list_models() -> dict[str, Any]:
+    return list_models_core()
+
+
+def list_models_core() -> dict[str, Any]:
     _configure_logging()
 
     models = [
@@ -325,14 +351,34 @@ def list_models() -> dict[str, Any]:
     }
 
 
-@mcp.tool()
+@mcp.tool("get_presets")
 def get_presets() -> dict[str, Any]:
+    return get_presets_core()
+
+
+def get_presets_core() -> dict[str, Any]:
     _configure_logging()
     return {"presets": _get_presets()}
 
 
-@mcp.tool()
+@mcp.tool("split_vocals_only")
 def split_vocals_only(
+    input_path: str,
+    output_dir: str,
+    model: str = "mdx_extra",
+    audio_format: str = "wav",
+    keep_intermediates: bool = False,
+) -> dict[str, Any]:
+    return split_vocals_only_core(
+        input_path=input_path,
+        output_dir=output_dir,
+        model=model,
+        audio_format=audio_format,
+        keep_intermediates=keep_intermediates,
+    )
+
+
+def split_vocals_only_core(
     input_path: str,
     output_dir: str,
     model: str = "mdx_extra",
