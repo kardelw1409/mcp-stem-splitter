@@ -192,27 +192,44 @@ def _notes_from_midi(path: Path, label: str, warnings: list[str]) -> list[tuple[
     return notes
 
 
-def _notes_from_adt_of(path: Path, warnings: list[str], thresholds=None, device: str = "auto") -> list[tuple[str, float]]:
-    """ADTOF (non-synthetic-music drum transcription) on an audio file, in-memory."""
-    try:
-        from adtof_pytorch import transcribe_to_midi
-    except Exception as error:
-        warnings.append(f"adt_of({path.name}): ADTOF unavailable ({error})")
-        return []
+def _notes_from_adt_of(
+    path: Path,
+    warnings: list[str],
+    thresholds: list[float] | None = None,
+    device: str = "auto",
+    allow_download: bool = True,
+) -> tuple[list[tuple[str, float]], dict]:
+    """ADTOF drum transcription of an audio file, in a temp file, plus provenance.
 
+    The model is reached through `adt_of`, which owns the weights (vendored in this
+    package, or downloaded and checksum-verified) and keeps library prints off stdout -
+    stdout carries the MCP protocol. Its provenance is returned so the caller can tell
+    which weights produced the notes.
+    """
     import tempfile
+
+    from . import adt_of
 
     with tempfile.TemporaryDirectory() as tmp:
         out = Path(tmp) / "adtof.mid"
-        kwargs: dict[str, Any] = {"device": _resolve_torch_device(device)}
-        if thresholds:
-            kwargs["thresholds"] = list(thresholds)
         try:
-            transcribe_to_midi(str(path), str(out), **kwargs)
+            info = adt_of.transcribe(
+                path,
+                out,
+                thresholds=thresholds,
+                device=_resolve_torch_device(device),
+                allow_download=allow_download,
+            )
         except Exception as error:
-            warnings.append(f"adt_of({path.name}): transcription failed ({error})")
-            return []
-        return _notes_from_midi(out, f"adt_of({path.name})", warnings)
+            warnings.append(f"adt_of({path.name}): transcription unavailable ({error})")
+            return [], {}
+        logger.info(
+            "adt_of %s: weights from %s (%s)",
+            path.name,
+            info["weights_source"],
+            info["implementation"],
+        )
+        return _notes_from_midi(out, f"adt_of({path.name})", warnings), info
 
 
 def _resolve_torch_device(device: str) -> str:
@@ -434,6 +451,8 @@ def drums_midi_core(
     bpm: float | None = None,
     grid_origin_s: float | None = None,
     mode: str = "balanced",
+    adt_of_thresholds: list[float] | None = None,
+    allow_model_download: bool = True,
     quantize_to_grid: bool = True,
     max_shift_ms: float = 60.0,
     min_support_db: float = 1.5,
@@ -468,11 +487,18 @@ def drums_midi_core(
 
     warnings: list[str] = []
     notes_by_source: dict[str, list[tuple[str, float]]] = {}
+    model_info: dict[str, Any] = {}
 
     if audio_path:
         audio = Path(audio_path).expanduser()
         _validate_input_file(audio)
-        mapped = _notes_from_adt_of(audio, warnings, device=device)
+        mapped, model_info = _notes_from_adt_of(
+            audio,
+            warnings,
+            thresholds=adt_of_thresholds,
+            device=device,
+            allow_download=allow_model_download,
+        )
         if mapped:
             notes_by_source["adt_of"] = mapped
         logger.info("adt_of: %d notes", len(mapped))
@@ -583,6 +609,7 @@ def drums_midi_core(
             "lone_support_db": lone_support_db,
         },
         "detector_classes": sorted(detector_classes) if detector_classes else "all",
+        "model": model_info,
         "sources": {label: len(notes) for label, notes in notes_by_source.items()},
         "warnings": warnings,
     }

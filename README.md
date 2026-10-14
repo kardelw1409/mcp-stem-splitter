@@ -94,3 +94,28 @@ compressed range.
 `hh.wav`, `toms.wav`, `ride.wav`, `crash.wav` - the `drumsep_(kick)_....wav` naming is
 also recognised). Without it, notes fall back to source agreement only and the report
 says `support_db: null` rather than pretending they were verified.
+
+## Model assets (nothing to install, no configured paths)
+
+The transcription model (`mcp_stem_splitter/vendor/adtof_pytorch`, a port of Zehren et
+al., see `NOTICE.md`) and its weights (`data/adtof_frame_rnn_pytorch_weights.pth`,
+3.6 MB) ship **inside this package**, so the server works on a fresh machine with no
+clone, no `PYTHONPATH` and no hardcoded path. Resolution order, first hit wins:
+
+1. `MCP_STEM_SPLITTER_ADTOF_WEIGHTS` - explicit file, an error if it is missing (a
+   silent fallback would hide a typo),
+2. the bundled file,
+3. a cache directory (`MCP_STEM_SPLITTER_CACHE`, else `%LOCALAPPDATA%\mcp-stem-splitter`
+   on Windows, else `~/.cache/mcp-stem-splitter`),
+4. a one-time download from the upstream repository - only when
+   `allow_model_download=True` (the default; pass `False` for strictly offline runs).
+
+The file is checked against a pinned SHA-256 **before** it is loaded, so a truncated or
+corrupted blob is refused instead of silently running with random weights (upstream
+loads weights only `if the path exists`, and a random-weight model still emits plausible
+MIDI - that is why the digest is pinned rather than trusted). Upstream prints to stdout,
+which is the JSON-RPC channel, so the library's output is redirected to stderr.
+
+The result's `model` field records the exact file, where it came from (`vendored`,
+`env`, `cache`, `downloaded`), its digest, the `device` used and the thresholds in
+force - report those instead of assuming the model loaded.

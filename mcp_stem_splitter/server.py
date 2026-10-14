@@ -255,15 +255,24 @@ def _download_ffmpeg_essentials(local_bin: Path) -> None:
 
 @mcp.tool("split_stems")
 def split_stems(
-    input_path: str,
-    output_dir: str,
-    model: str = "mdx_extra",
-    stems: str = "4stems",
-    audio_format: str = "wav",
-    keep_intermediates: bool = False,
-    filename_mode: str = "fixed",
-    device: str = "auto",
+    input_path: Annotated[str, Field(description="Audio file to split.")],
+    output_dir: Annotated[str, Field(description="Directory for the stems; created if missing.")],
+    model: Annotated[str, Field(description='Demucs model name: mdx_extra (default, best quality), htdemucs, htdemucs_ft (4x slower, ~1 % better), or htdemucs_6s.')] = "mdx_extra",
+    stems: Annotated[str, Field(description="Only '4stems' is supported: drums, bass, vocals, other.")] = "4stems",
+    audio_format: Annotated[str, Field(description="wav | flac | mp3 for the written stems.")] = "wav",
+    keep_intermediates: Annotated[bool, Field(description="Keep intermediate files written by the separator.")] = False,
+    filename_mode: Annotated[str, Field(description="fixed -> drums.wav; prefixed -> <inputname>_drums.wav.")] = "fixed",
+    device: Annotated[str, Field(description="auto | cpu | cuda | cuda:N | directml. auto uses CUDA when the installed torch supports it.")] = "auto",
 ) -> dict[str, Any]:
+    """Split a track into four stems: drums, bass, vocals, other.
+
+    Use this when the user wants instrument stems for mixing, remixing or for feeding a
+    later step (drum transcription needs the drum elements, which are a different split -
+    see drums_midi). Weights download automatically on first use (~300 MB for mdx_extra).
+
+    Returns absolute paths for every stem. On a 8 GB laptop GPU expect roughly 18 s per
+    4 minutes of audio with htdemucs; mdx_extra is slower but separates better.
+    """
     return split_stems_core(
         input_path=input_path,
         output_dir=output_dir,
@@ -331,6 +340,12 @@ def split_stems_core(
 
 @mcp.tool("list_models")
 def list_models() -> dict[str, Any]:
+    """List the supported separation models and presets.
+
+    Call this before split_stems when unsure which model name is valid. The list is
+    curated and short on purpose: names outside it are usually quantized variants that
+    need C++ build tools on Windows.
+    """
     return list_models_core()
 
 
@@ -354,6 +369,11 @@ def list_models_core() -> dict[str, Any]:
 
 @mcp.tool("get_presets")
 def get_presets() -> dict[str, Any]:
+    """Describe the available stem presets (which outputs each one produces).
+
+    Useful before split_stems to check whether a two-stem (vocals/instrumental) or a
+    four-stem result is what the task needs.
+    """
     return get_presets_core()
 
 
@@ -364,12 +384,18 @@ def get_presets_core() -> dict[str, Any]:
 
 @mcp.tool("split_vocals_only")
 def split_vocals_only(
-    input_path: str,
-    output_dir: str,
-    model: str = "mdx_extra",
-    audio_format: str = "wav",
-    keep_intermediates: bool = False,
+    input_path: Annotated[str, Field(description="Audio file to split.")],
+    output_dir: Annotated[str, Field(description="Directory for the two files; created if missing.")],
+    model: Annotated[str, Field(description="Demucs model name; mdx_extra by default.")] = "mdx_extra",
+    audio_format: Annotated[str, Field(description="wav | flac | mp3.")] = "wav",
+    keep_intermediates: Annotated[bool, Field(description="Keep intermediate files.")] = False,
 ) -> dict[str, Any]:
+    """Split a track into vocals + instrumental only (two files).
+
+    Cheaper and cleaner than split_stems when nothing but a vocal/instrumental pair is
+    needed, e.g. for karaoke or for a vocal-only analysis. The instrumental is the sum of
+    the drums, bass and other stems that the model produced.
+    """
     return split_vocals_only_core(
         input_path=input_path,
         output_dir=output_dir,
@@ -457,6 +483,8 @@ def drums_midi(
     bpm: Annotated[float | None, Field(description="Tempo for 1/16 quantisation (use the MEASURED tempo). Omit to skip quantisation entirely.")] = None,
     grid_origin_s: Annotated[float | None, Field(description="Measured grid phase in seconds (e.g. grid.origin_s from the audiocpp manifest). Prefer this over estimating from the notes: an estimate cannot fix a systematic offset.")] = None,
     mode: Annotated[str, Field(description="balanced (default) | strict | consensus | full - how strictly sources must agree and the element support the note.")] = "balanced",
+    adt_of_thresholds: Annotated[list[float] | None, Field(description="Per-class onset thresholds for ADTOF, in class order [kick, snare, tom, hihat, cymbal]. Omit for the model defaults; the measured set [0.176, 0.192, 0.32, 0.132, 0.24] trades a little precision for more hits (validated with the element support test).")] = None,
+    allow_model_download: Annotated[bool, Field(description="Allow fetching the transcription weights once if they are not bundled. Set false for strictly offline runs.")] = True,
     quantize_to_grid: Annotated[bool, Field(description="Pull notes onto the 1/16 grid when bpm is given.")] = True,
     max_shift_ms: Annotated[float, Field(description="How far quantisation may move a note; anything further away is left untouched.")] = 60.0,
     split_by_class: Annotated[bool, Field(description="Also write one MIDI file per drum class (kick/snare/hihat/tom/cymbal) so a DAW can place them as separate items.")] = True,
@@ -498,6 +526,15 @@ def drums_midi(
     Note: strict needs two independent sources, so with a single model plus the detector
     it mainly keeps hi-hats. It is not a synonym for "better".
 
+    MODEL ASSETS - NOTHING TO INSTALL
+    The transcription model and its weights ship inside this server package, so the tool
+    works on a fresh machine with no external download and no configured path. The file
+    is matched against a pinned SHA-256 before loading; a wrong or half-copied blob is
+    refused instead of silently loading random weights. Resolution order, first hit wins:
+    MCP_STEM_SPLITTER_ADTOF_WEIGHTS, the bundled file, a cache directory, then a one-time
+    download (only if allow_model_download is true). A GPU is used when present, otherwise
+    CPU - the tool reports which in the result's model field rather than assuming.
+
     WHICH SOURCE COVERS WHICH CLASS (measured, full 270 s drum & bass track)
     A 5-class transcription model has almost no toms and cymbals (16 and 6 notes over the
     whole track - its vocabulary has no ride/crash), while the detector is productive
@@ -532,7 +569,8 @@ def drums_midi(
     tom 45, cymbal 49) so the DAW can place them as separate items.
     The result also carries notes{total,by_class,clusters_considered},
     velocity{...}, velocity_reference, grid{...}, arbiter{elements_used,durations,...},
-    sources and detector_classes.
+    sources, detector_classes and model (which weights file was used, where it came
+    from, its digest, and the device).
 
     ALWAYS READ warnings BEFORE REPORTING SUCCESS: they flag a missing element, a source
     that could not be read, and elements shorter than the audio (in which case every note
@@ -549,6 +587,8 @@ def drums_midi(
         bpm=bpm,
         grid_origin_s=grid_origin_s,
         mode=mode,
+        adt_of_thresholds=adt_of_thresholds,
+        allow_model_download=allow_model_download,
         quantize_to_grid=quantize_to_grid,
         max_shift_ms=max_shift_ms,
         split_by_class=split_by_class,

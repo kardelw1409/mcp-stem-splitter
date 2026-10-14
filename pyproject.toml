@@ -7,6 +7,10 @@ dependencies = [
   "mcp>=1.0.0",
   "demucs>=4.0.0",
   "soundfile>=0.12.1",
+  "torch",
+  "librosa",
+  "pretty_midi",
+  "numpy",
 ]
 
 [project.scripts]
@@ -18,3 +22,8 @@ build-backend = "setuptools.build_meta"
 
 [tool.setuptools.packages.find]
 where = ["."]
+
+# the drum-transcription model ships with the package so a fresh install needs no
+# network and no path to anyone's checkout (see mcp_stem_splitter/adt_of.py)
+[tool.setuptools.package-data]
+"mcp_stem_splitter.vendor.adtof_pytorch" = ["data/*.pth", "NOTICE.md"]
