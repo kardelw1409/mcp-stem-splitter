@@ -165,6 +165,52 @@ class TestToolContract(unittest.TestCase):
         with self.assertRaises(ValueError):
             drums_midi_core(extra_midi=["x.mid"], output_dir=tempfile.mkdtemp(), mode="nope")
 
+    def test_rejects_unknown_detector_class(self):
+        """A typo in detector_classes must fail loudly, not silently keep every class."""
+        import numpy as np
+        import soundfile as sf
+
+        from mcp_stem_splitter.drums import drums_midi_core
+
+        with tempfile.TemporaryDirectory() as tmp:
+            elements = Path(tmp) / "elements"
+            elements.mkdir()
+            for name in ("kick", "snare", "hh", "toms", "ride", "crash"):
+                sf.write(str(elements / f"{name}.wav"), np.zeros(48000, dtype=np.float32), 48000)
+
+            with self.assertRaises(ValueError):
+                drums_midi_core(element_stems_dir=str(elements), output_dir=str(Path(tmp) / "out"),
+                                bpm=120.0, detector_classes=["kick", "kikc"])
+
+    def test_detector_classes_restrict_votes(self):
+        """The hybrid: the detector may vote only for the classes the models miss."""
+        import numpy as np
+        import soundfile as sf
+
+        from mcp_stem_splitter.drums import drums_midi_core
+
+        with tempfile.TemporaryDirectory() as tmp:
+            elements = Path(tmp) / "elements"
+            elements.mkdir()
+            sr = 8000
+            for name in ("kick", "snare", "hh", "toms", "ride", "crash"):
+                clicks = np.zeros(sr * 4, dtype=np.float32)
+                for i in range(1, 4):
+                    clicks[i * sr] = 1.0
+                sf.write(str(elements / f"{name}.wav"), clicks, sr)
+
+            allowed = drums_midi_core(element_stems_dir=str(elements), output_dir=str(Path(tmp) / "a"),
+                                      bpm=120.0, use_detector=True, detector_classes=["tom"])
+            unrestricted = drums_midi_core(element_stems_dir=str(elements), output_dir=str(Path(tmp) / "b"),
+                                           bpm=120.0, use_detector=True)
+
+            self.assertEqual(unrestricted["detector_classes"], "all")
+            self.assertEqual(allowed["detector_classes"], ["tom"])
+            self.assertGreater(unrestricted["notes"]["total"], allowed["notes"]["total"])
+            # only the allowed class may gain notes from the restricted detector
+            for cls in ("kick", "snare", "hihat", "cymbal"):
+                self.assertEqual(allowed["notes"]["by_class"][cls], 0, cls)
+
     def test_per_class_files_are_written(self):
         import pretty_midi
 

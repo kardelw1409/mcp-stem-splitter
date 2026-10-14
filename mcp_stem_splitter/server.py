@@ -460,6 +460,7 @@ def drums_midi(
     max_shift_ms: float = 60.0,
     split_by_class: bool = True,
     use_detector: bool = True,
+    detector_classes: list[str] | None = None,
     device: str = "auto",
 ) -> dict[str, Any]:
     from .drums import drums_midi_core
@@ -476,6 +477,7 @@ def drums_midi(
         max_shift_ms=max_shift_ms,
         split_by_class=split_by_class,
         use_detector=use_detector,
+        detector_classes=detector_classes,
         device=device,
     )
 

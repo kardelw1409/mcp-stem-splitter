@@ -440,6 +440,7 @@ def drums_midi_core(
     lone_support_db: float = 3.0,
     split_by_class: bool = True,
     use_detector: bool = True,
+    detector_classes: list[str] | None = None,
     device: str = "auto",
 ) -> dict[str, Any]:
     """Build one drum MIDI (and per-class files) from audio and/or existing MIDI sources.
@@ -448,6 +449,12 @@ def drums_midi_core(
     detection inside the separated drum elements. The elements are also the arbiter:
     a note must be louder than that element's own median level, unless nothing is
     provided to check against (then only the vote count applies and the report says so).
+
+    `detector_classes` exists because the two source kinds cover different classes: a
+    transcription model with a fixed vocabulary may have almost no toms or cymbals
+    (measured: 16 and 6 over a whole track), while the detector is productive exactly
+    there - and over-productive on toms, whose analysis band overlaps kick and snare.
+    Restricting the detector to the classes the models miss is the honest middle.
     """
     _configure_logging()
 
@@ -495,6 +502,13 @@ def drums_midi_core(
         durations = _duration_mismatch_warning(signals, audio_path, warnings)
         if use_detector:
             detected = _notes_from_elements(element_dir, warnings)
+            if detector_classes:
+                unknown = sorted(set(detector_classes) - set(CLASSES))
+                if unknown:
+                    raise ValueError(f"detector_classes has unknown classes: {unknown}; valid: {list(CLASSES)}")
+                before = len(detected)
+                detected = [item for item in detected if item[0] in set(detector_classes)]
+                logger.info("detector restricted to %s: %d of %d onsets kept", detector_classes, len(detected), before)
             if detected:
                 notes_by_source["detector"] = detected
             logger.info("detector: %d onsets", len(detected))
@@ -568,6 +582,7 @@ def drums_midi_core(
             "min_support_db": min_support_db,
             "lone_support_db": lone_support_db,
         },
+        "detector_classes": sorted(detector_classes) if detector_classes else "all",
         "sources": {label: len(notes) for label, notes in notes_by_source.items()},
         "warnings": warnings,
     }
