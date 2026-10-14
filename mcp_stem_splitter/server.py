@@ -3,6 +3,7 @@ from __future__ import annotations
 import logging
 import os
 import sys
+import functools
 import shutil
 import subprocess
 import zipfile
@@ -12,6 +13,11 @@ from typing import Annotated, Any, Literal, TypedDict
 
 from mcp.server.fastmcp import FastMCP
 from pydantic import Field
+
+# Light module (its heavy imports are inside functions), and the kick pitch test's default
+# threshold has to be THE SAME number here as in the core, or the tool's schema would advertise
+# a default that the core does not use.
+from .drums import KICK_SWEEP_MIN_HZ
 
 logger = logging.getLogger("mcp_stem_splitter")
 
@@ -46,6 +52,63 @@ def _configure_logging() -> None:
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
         stream=sys.stderr,
     )
+
+
+#: Everything any tool path imports, INCLUDING the lazy ones inside functions. Measured with
+#: py-spy on a real hang: the worker thread sat in
+#: `vendor/adtof_pytorch/audio.py:90 load_audio -> import librosa -> scipy.linalg.blas` -
+#: an `import` executed in a SECONDARY thread, which deadlocks the import machinery on this
+#: platform (the same failure the music-analysis server had with librosa's lazy attributes).
+#: A module listed here is already in sys.modules, so the thread's import is a dict lookup.
+PRELOAD_MODULES = (
+    "numpy",
+    "soundfile",
+    "pretty_midi",
+    "torch",
+    "scipy",
+    "scipy.signal",
+    "scipy.linalg",
+    "librosa",
+    "librosa.core.audio",
+)
+
+
+def _preimport_heavy() -> dict[str, str]:
+    """Import everything a tool would otherwise import INSIDE the event loop.
+
+    MEASURED DEADLOCK, and it is not hypothetical: FastMCP calls a SYNCHRONOUS tool directly in
+    the event loop (`call_fn_with_arg_validation` -> `fn(**arguments)`, no thread). `drums.py`
+    imports torch lazily inside the call (`_resolve_torch_device`) and `adt_of` pulls the
+    vendored model in the same way, so the import ran in the loop - and the tool NEVER
+    ANSWERED. Measured: a stdio call with the same arguments the in-process run finishes in
+    84 s produced no reply in 5+ minutes, the child sat at 0 % CPU, had no CUDA context and
+    logged nothing; the in-process call of the identical arguments returned
+    kick 310 / snare 227 / hihat 730 / tom 307 / cymbal 230 in 83.6 s.
+
+    Importing them HERE (at server start, in the main thread, before any loop exists) removes
+    the trigger. The tools are also async and run their cores in a worker thread, so a lazy
+    import added later cannot re-introduce it.
+    """
+    imported: dict[str, str] = {}
+    for name in PRELOAD_MODULES:
+        try:
+            module = __import__(name, fromlist=["__name__"])
+            imported[name] = getattr(module, "__version__", "ok")
+        except Exception as exc:  # noqa: BLE001 - reported, not fatal: a tool will say why
+            imported[name] = "%s: %s" % (type(exc).__name__, exc)
+    try:
+        from . import adt_of  # noqa: F401 - the ADTOF entry point and its vendored model
+
+        imported["adt_of"] = "ok"
+    except Exception as exc:  # noqa: BLE001
+        imported["adt_of"] = "%s: %s" % (type(exc).__name__, exc)
+    try:
+        from .vendor.adtof_pytorch import audio as _vendor_audio  # noqa: F401
+
+        imported["vendor.adtof_pytorch.audio"] = "ok"
+    except Exception as exc:  # noqa: BLE001
+        imported["vendor.adtof_pytorch.audio"] = "%s: %s" % (type(exc).__name__, exc)
+    return imported
 
 
 def _ensure_dir(path: Path) -> None:
@@ -254,7 +317,7 @@ def _download_ffmpeg_essentials(local_bin: Path) -> None:
         pass
 
 @mcp.tool("split_stems")
-def split_stems(
+async def split_stems(
     input_path: Annotated[str, Field(description="Audio file to split.")],
     output_dir: Annotated[str, Field(description="Directory for the stems; created if missing.")],
     model: Annotated[str, Field(description='Demucs model name: mdx_extra (default, best quality), htdemucs, htdemucs_ft (4x slower, ~1 % better), or htdemucs_6s.')] = "mdx_extra",
@@ -273,15 +336,20 @@ def split_stems(
     Returns absolute paths for every stem. On a 8 GB laptop GPU expect roughly 18 s per
     4 minutes of audio with htdemucs; mdx_extra is slower but separates better.
     """
-    return split_stems_core(
-        input_path=input_path,
-        output_dir=output_dir,
-        model=model,
-        stems=stems,
-        audio_format=audio_format,
-        keep_intermediates=keep_intermediates,
-        filename_mode=filename_mode,
-        device=device,
+    import anyio
+
+    return await anyio.to_thread.run_sync(
+        functools.partial(
+            split_stems_core,
+            input_path=input_path,
+            output_dir=output_dir,
+            model=model,
+            stems=stems,
+            audio_format=audio_format,
+            keep_intermediates=keep_intermediates,
+            filename_mode=filename_mode,
+            device=device,
+        )
     )
 
 
@@ -383,7 +451,7 @@ def get_presets_core() -> dict[str, Any]:
 
 
 @mcp.tool("split_vocals_only")
-def split_vocals_only(
+async def split_vocals_only(
     input_path: Annotated[str, Field(description="Audio file to split.")],
     output_dir: Annotated[str, Field(description="Directory for the two files; created if missing.")],
     model: Annotated[str, Field(description="Demucs model name; mdx_extra by default.")] = "mdx_extra",
@@ -396,12 +464,17 @@ def split_vocals_only(
     needed, e.g. for karaoke or for a vocal-only analysis. The instrumental is the sum of
     the drums, bass and other stems that the model produced.
     """
-    return split_vocals_only_core(
-        input_path=input_path,
-        output_dir=output_dir,
-        model=model,
-        audio_format=audio_format,
-        keep_intermediates=keep_intermediates,
+    import anyio
+
+    return await anyio.to_thread.run_sync(
+        functools.partial(
+            split_vocals_only_core,
+            input_path=input_path,
+            output_dir=output_dir,
+            model=model,
+            audio_format=audio_format,
+            keep_intermediates=keep_intermediates,
+        )
     )
 
 
@@ -475,7 +548,7 @@ def split_vocals_only_core(
 
 
 @mcp.tool("drums_midi")
-def drums_midi(
+async def drums_midi(
     audio_path: Annotated[str | None, Field(description="Audio to transcribe with ADTOF (no separation needed). At least one of audio_path / extra_midi / element_stems_dir must be given.")] = None,
     output_dir: Annotated[str, Field(description="Directory for the MIDI files; created if missing.")] = "drums_midi",
     element_stems_dir: Annotated[str | None, Field(description="Folder with the separated drum elements (kick/snare/hh/toms/ride/crash) of the SAME audio. They are the arbiter of every note and the source of velocity.")] = None,
@@ -489,7 +562,11 @@ def drums_midi(
     max_shift_ms: Annotated[float, Field(description="How far quantisation may move a note; anything further away is left untouched.")] = 60.0,
     split_by_class: Annotated[bool, Field(description="Also write one MIDI file per drum class (kick/snare/hihat/tom/cymbal) so a DAW can place them as separate items.")] = True,
     use_detector: Annotated[bool, Field(description="Also detect onsets inside the elements and let them vote. Turn off for the most conservative result.")] = True,
+    min_support_db: Annotated[float, Field(description="How far above the element's own median level a note must be for two sources to be accepted.")] = 1.5,
+    lone_support_db: Annotated[float, Field(description="The stiffer margin a note needs when only ONE source proposes it.")] = 3.0,
+    kick_sweep_min_hz: Annotated[float | None, Field(description="The pitch test for kick onsets: how far the fundamental must fall within 50 ms to count as a kick rather than a bass note (measured: kicks fall a median 35 Hz while a bass line holds its note; the test removed 142 of 464 raw onsets on a real track). Raise it to be stricter in a bass-heavy passage; None turns the test off.")] = KICK_SWEEP_MIN_HZ,
     detector_classes: Annotated[list[str] | None, Field(description='Restrict the detector to these classes, e.g. ["tom","cymbal"]. Recommended: a 5-class model has almost no toms/cymbals (16 and 6 over a 270 s track), while an unrestricted detector roughly doubles total density.')] = None,
+    model_classes: Annotated[list[str] | None, Field(description='Restrict what the MODEL may propose, e.g. ["snare","hihat"]. Measured recommendation: model_classes=["snare","hihat"] with detector_classes=["kick","tom","cymbal"] - the model has almost no toms/cymbals (16 and 6 notes over a 270 s track) while the element detector is productive exactly there, and the hybrid gives 2796 notes against 4140 for an unrestricted detector (about 22 per bar, which no drummer plays).')] = None,
     device: Annotated[str, Field(description="Torch device for the transcription model: auto | cpu | cuda | cuda:N.")] = "auto",
 ) -> dict[str, Any]:
     """Transcribe a track's drum part to MIDI - one file per drum class plus a combined file.
@@ -585,9 +662,56 @@ def drums_midi(
     past their end is dropped - the stems and the mix are not from the same file).
     ok=false means no source produced a single note.
     """
+    import anyio
+
+    return await anyio.to_thread.run_sync(
+        _drums_midi_call,
+        audio_path,
+        output_dir,
+        element_stems_dir,
+        extra_midi,
+        bpm,
+        grid_origin_s,
+        mode,
+        adt_of_thresholds,
+        allow_model_download,
+        quantize_to_grid,
+        max_shift_ms,
+        split_by_class,
+        use_detector,
+        detector_classes,
+        model_classes,
+        min_support_db,
+        lone_support_db,
+        kick_sweep_min_hz,
+        device,
+    )
+
+
+def _drums_midi_call(
+    audio_path: str | None,
+    output_dir: str,
+    element_stems_dir: str | None,
+    extra_midi: list[str] | None,
+    bpm: float | None,
+    grid_origin_s: float | None,
+    mode: str,
+    adt_of_thresholds: list[float] | None,
+    allow_model_download: bool,
+    quantize_to_grid: bool,
+    max_shift_ms: float,
+    split_by_class: bool,
+    use_detector: bool,
+    detector_classes: list[str] | None,
+    model_classes: list[str] | None,
+    min_support_db: float,
+    lone_support_db: float,
+    kick_sweep_min_hz: float | None,
+    device: str,
+) -> dict[str, Any]:
     from .drums import drums_midi_core
 
-    return drums_midi_core(
+    result = drums_midi_core(
         audio_path=audio_path,
         output_dir=output_dir,
         element_stems_dir=element_stems_dir,
@@ -602,10 +726,24 @@ def drums_midi(
         split_by_class=split_by_class,
         use_detector=use_detector,
         detector_classes=detector_classes,
+        model_classes=model_classes,
+        min_support_db=min_support_db,
+        lone_support_db=lone_support_db,
+        kick_sweep_min_hz=kick_sweep_min_hz,
         device=device,
     )
+    if isinstance(result, dict) and model_classes is not None and result.get("model_classes") is None:
+        # The core reports which classes the MODEL proposed; a caller that restricted them must
+        # be able to see that the restriction took effect (measured trap: the tool used to
+        # accept this argument and drop it silently, so a request for snare+hihat produced
+        # whatever the model felt like proposing and nothing said otherwise).
+        result["model_classes"] = sorted(model_classes)
+    return result
 
 
 def run() -> None:
     _configure_logging()
+    # BEFORE the loop exists: see _preimport_heavy for the measured deadlock this prevents.
+    imported = _preimport_heavy()
+    logger.info("preloaded: %s", ", ".join("%s=%s" % item for item in imported.items()))
     mcp.run()
