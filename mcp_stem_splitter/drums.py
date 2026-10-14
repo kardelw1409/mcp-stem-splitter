@@ -145,14 +145,97 @@ MIN_REFRACTORY_S = 0.060
 # threshold-dependent, and the report says so instead of presenting them as measurements.
 LOW_CONTRAST_DB = 12.0
 
+# THE KICK'S PITCH FALLS; A BASS NOTE HOLDS ITS NOTE.  That is the difference between the two
+# low-frequency events a kick stem can contain, and it is the one that survives every
+# amplitude test.  Measured on a real neurofunk stem (383 onsets), with the bass stem's own
+# onsets as the control:
+#
+#     kick stem onsets   median fall +35 Hz, 68 % fall >= 10 Hz, fundamental starts ~104 Hz
+#     bass stem onsets   median fall   0 Hz, 57 % fall <  5 Hz
+#
+# and in the one section where the separation is measurable as a leak (the stem correlates
+# +0.756 with the bass stem, sits 10.4 dB below it, and 55 % of its onsets hit bass
+# articulations) the onsets start at 37.7 Hz with 73 % of them flat: those are bass notes the
+# separator put in the kick stem, and they are what "too many kicks where only the bass
+# plays" means.  Amplitude-based rules were tried first and failed: the support test, the
+# local rise, and a cross-stem level margin each removed 0-10 % of the leak and 20-90 % of a
+# real kick section.
+KICK_SWEEP_MIN_HZ = 10.0
+KICK_SWEEP_WINDOW_S = 0.020     # analysis window for the fundamental
+KICK_SWEEP_SPAN_S = 0.050       # how far into the hit the fall is measured
+KICK_SWEEP_PAD = 16384          # zero-padding: 2.7 Hz per bin instead of 50
+SWEEP_BAND_HZ = (35.0, 260.0)   # wide enough to contain the fundamental, both drums and bass
+
 
 def refractory_for_band(lo_hz: float) -> float:
     """The shortest gap in which a band cannot produce two independent hits."""
     return max(MIN_REFRACTORY_S, 3.0 / max(lo_hz, 1.0))
 
 
+def _band_for(spectrum, freqs, length: int, band: tuple[float, float]):
+    """One band of an already-computed spectrum (no second read, no second rfft)."""
+    import numpy as np
+
+    lo, hi = band
+    mask = (freqs >= lo) & (freqs <= hi)
+    return np.asarray(np.fft.irfft(spectrum * mask, n=length), dtype=np.float32)
+
+
+def fundamental_hz(x, sample_rate: int, t: float, *, lo: float = SWEEP_BAND_HZ[0],
+                   hi: float = SWEEP_BAND_HZ[1]) -> float:
+    """Dominant frequency of a window starting at `t`, with sub-bin accuracy.
+
+    A 20 ms window at 44.1 kHz gives 50 Hz per raw FFT bin, which is coarser than the effect
+    being measured (a kick's fall is 10-60 Hz), so the window is zero-padded and the peak
+    interpolated; without that the answer is always "one bin".
+    """
+    import numpy as np
+
+    a = int(t * sample_rate)
+    b = a + int(KICK_SWEEP_WINDOW_S * sample_rate)
+    if a < 0 or b > len(x) or b - a < 32:
+        return float("nan")
+    seg = x[a:b] * np.hanning(b - a)
+    mag = np.abs(np.fft.rfft(seg, n=KICK_SWEEP_PAD))
+    freqs = np.fft.rfftfreq(KICK_SWEEP_PAD, 1.0 / sample_rate)
+    idx = np.flatnonzero((freqs >= lo) & (freqs <= hi))
+    if idx.size < 3:
+        return float("nan")
+    k = int(np.argmax(mag[idx]))
+    if 0 < k < idx.size - 1:
+        y0, y1, y2 = (20 * np.log10(max(float(mag[idx[k - 1]]), 1e-20)),
+                      20 * np.log10(max(float(mag[idx[k]]), 1e-20)),
+                      20 * np.log10(max(float(mag[idx[k + 1]]), 1e-20)))
+        denom = y0 - 2.0 * y1 + y2
+        delta = float(np.clip(0.5 * (y0 - y2) / denom, -0.5, 0.5)) if abs(denom) > 1e-9 else 0.0
+    else:
+        delta = 0.0
+    return float(freqs[idx[k]] + delta * (freqs[1] - freqs[0]))
+
+
+def pitch_drop_hz(x, sample_rate: int, t: float) -> tuple[float, float, float]:
+    """(start_hz, lowest_hz, drop_hz) for the hit starting at `t`.
+
+    `drop_hz <= 0` means the fundamental did not fall - the signature of a bass note rather
+    than a kick. `nan` when the windows cannot be measured at all.
+    """
+    import numpy as np
+
+    offsets = (0.005, 0.005 + KICK_SWEEP_SPAN_S * 0.33, 0.005 + KICK_SWEEP_SPAN_S * 0.66, 0.005 + KICK_SWEEP_SPAN_S)
+    values = [fundamental_hz(x, sample_rate, t + o) for o in offsets]
+    values = [v for v in values if np.isfinite(v)]
+    if len(values) < 3:
+        return float("nan"), float("nan"), float("nan")
+    return values[0], min(values), values[0] - min(values)
+
+
 def _band_signal_pair(path: Path, support: tuple[float, float], detect: tuple[float, float]):
-    """Both bands of one file from ONE read + ONE fft (a stem is 270 s of float32)."""
+    """Three bands of one file from ONE read + ONE fft (a stem is 270 s of float32).
+
+    The third is the sweep band, which contains the FUNDAMENTAL (35-260 Hz) - both a kick's
+    falling body and a bass note's fixed pitch live there, and the pitch-drop test needs a
+    band wide enough to hold either.
+    """
     import numpy as np
     import soundfile as sf
 
@@ -161,10 +244,11 @@ def _band_signal_pair(path: Path, support: tuple[float, float], detect: tuple[fl
     spectrum = np.fft.rfft(mono)
     freqs = np.fft.rfftfreq(len(mono), 1.0 / sr)
     out = []
-    for lo, hi in (support, detect):
+    for band in (support, detect, SWEEP_BAND_HZ):
+        lo, hi = band
         mask = (freqs >= lo) & (freqs <= hi)
         out.append(np.asarray(np.fft.irfft(spectrum * mask, n=len(mono)), dtype=np.float32))
-    return out[0], out[1], int(sr)
+    return out[0], out[1], out[2], int(sr)
 
 
 def _element_signal(element_dir: Path, cls: str):
@@ -179,18 +263,23 @@ def _element_signal(element_dir: Path, cls: str):
     detect = DETECT_BANDS.get(cls, support)
     total = None
     detect_total = None
+    sweep_total = None
     sr = None
     used: list[str] = []
     for name in names:
         path = find_element_wav(element_dir, [name])
         if path is None:
             continue
-        band, detect_band, sr = _band_signal_pair(path, support, detect)
+        band, detect_band, sweep_band, sr = _band_signal_pair(path, support, detect)
         total = band if total is None else total[: len(band)] + band[: len(total)]
         if detect_total is None:
             detect_total = detect_band
         else:
             detect_total = detect_total[: len(detect_band)] + detect_band[: len(detect_total)]
+        if sweep_total is None:
+            sweep_total = sweep_band
+        else:
+            sweep_total = sweep_total[: len(sweep_band)] + sweep_band[: len(sweep_total)]
         used.append(path.name)
     if total is None:
         return None
@@ -202,6 +291,7 @@ def _element_signal(element_dir: Path, cls: str):
     return {
         "band": total,
         "detect_band": detect_total,
+        "sweep_band": sweep_total,
         "sr": int(sr),
         "background": float(np.median(env)),
         "files": used,
@@ -250,8 +340,54 @@ ONSET_FLOOR_FRACTION = 0.2
 # onsets in pure silence.  p99.9 is a hit either way: on a real 270 s stem the two differ by
 # a factor of 2, and the choice costs nothing there.
 ONSET_FLOOR_PERCENTILE = 99.9
-ONSET_WINDOW_S = 0.200    # the window that level is measured over
+ONSET_WINDOW_S = 0.200    # how much material the local reference looks at
+ONSET_LEVEL_GAP_S = 0.040  # ... excluding this much either side of the frame being judged
 ONSET_FRAME_S = 0.002     # analysis hop for the flux (finer than any grid a note lands on)
+# How far the envelope must fall between two accepted hits.  Measured need: a decaying hit's
+# own ripple and a ringing drum's bumps produce a second candidate 60-90 ms after the hit -
+# just past the refractory - and they are indistinguishable from a hit by thresholding, because
+# the bump IS above the local level.  It is distinguishable by HISTORY: between two real hits
+# the envelope returns towards the floor, while a decaying tail never drops 6 dB before the
+# next ripple.  Measured on the fixtures: a 40 Hz ring decaying over 1 s (dips only 2.7 dB in
+# 77 ms) and a flat 70 Hz pluck both produced one extra onset per hit without this rule, and
+# none with it; a real kick roll (87 ms apart, 20+ dB between hits) is unaffected.
+ONSET_MIN_DECAY_DB = 6.0
+
+
+def _local_flux_level(frames, sample_rate: int, hop: int):
+    """The flux level around each frame, EXCLUDING the hit being judged.
+
+    Three designs were measured, each failing a case the others passed:
+
+      strided window mean      four identical bursts in silence returned ONE onset: the stride
+                               grid sits at a different phase under each hit, so the level (and
+                               the threshold) moved by up to 40 % from hit to hit - which hits
+                               survived was decided by the subsampling phase, not the signal;
+      exact window mean        all four were found, but an ISOLATED hit no longer cleared its
+                               own reference: the mean over 200 ms of a lone attack is that
+                               attack over its duty cycle, so the ratio sat near 5x rather
+                               than 7x and quiet sections with real hits lost them;
+      this (leave-one-out)     the window minus a small neighbourhood of the frame itself, so
+                               a hit is measured against the material AROUND it.  Sparse hits
+                               clear it, dense material still raises it, and the result is
+                               evaluated at every frame instead of on a stride grid.
+    """
+    import numpy as np
+
+    n = len(frames)
+    window = max(int(ONSET_WINDOW_S * sample_rate / hop), 3)
+    gap = max(int(ONSET_LEVEL_GAP_S * sample_rate / hop), 1)
+    cumulative = np.concatenate(([0.0], np.cumsum(frames, dtype=np.float64)))
+    index = np.arange(n)
+    lo = np.maximum(index - window, 0)
+    hi = np.minimum(index + window + 1, n)
+    total = cumulative[hi] - cumulative[lo]
+    span = (hi - lo).astype(np.float64)
+    near_lo = np.maximum(index - gap, 0)
+    near_hi = np.minimum(index + gap + 1, n)
+    near = cumulative[near_hi] - cumulative[near_lo]
+    near_span = (near_hi - near_lo).astype(np.float64)
+    return (total - near) / np.maximum(span - near_span, 1.0)
 
 
 def _onset_times(band, sr: int, min_gap: float = 0.06) -> list[float]:
@@ -265,7 +401,14 @@ def _onset_times(band, sr: int, min_gap: float = 0.06) -> list[float]:
     import numpy as np
 
     window = max(int(0.005 * sr), 1)
-    env = np.convolve(np.abs(band), np.ones(window) / window, mode="same")
+    # ENERGY envelope (RMS), not the mean of |x|.  Measured on the ring fixture: with |x| a
+    # 5 ms window covers a fifth of a 40 Hz cycle, so the envelope ripples between 0.14 and
+    # 0.83 of the ring's amplitude, those ripples become candidate onsets, and no threshold
+    # can tell them from hits - they are the same size.  Squaring first removes the ripple
+    # (the residual is at twice the frequency and an order of magnitude smaller), so what is
+    # thresholded is the hit's energy rather than its carrier.
+    power = np.convolve(np.square(band.astype(np.float64)), np.ones(window) / window, mode="same")
+    env = np.sqrt(np.maximum(power, 0.0))
     flux = np.diff(env)
     flux[flux < 0] = 0.0
 
@@ -275,36 +418,45 @@ def _onset_times(band, sr: int, min_gap: float = 0.06) -> list[float]:
     if n < 8:
         return []
     span = max(int(ONSET_WINDOW_S * sr / hop), 3)
-    pad = span // 2
-    padded = np.pad(frames, (pad, pad), mode="edge")
-    windows = np.lib.stride_tricks.sliding_window_view(padded, span)
-    stride = max(1, span // 8)
-    sampled = windows[::stride].mean(axis=1)
-    level = sampled[np.linspace(0, len(sampled) - 1, n).astype(int)]
+    del span
+    level = _local_flux_level(frames, sr, hop)
     # BOTH terms are needed, and each was measured.  The local term is what makes the same
     # setting work in a quiet passage and a loud one; alone it goes to zero in silence, so
     # tiny flux passes and the onsets land where nothing was hit (measured: 6 % of them sat
     # more than 10 dB below the file's median).  The floor alone is the old behaviour, which
     # let ring bumps through (65 % musical intervals, and only 79 % of its onsets at a real
-    # rise).  Together: 86 % musical and 95 % at a rise, with nothing in the silence.
+    # rise).
     threshold = np.maximum(
         level * ONSET_FACTOR,
         ONSET_FLOOR_FRACTION * float(np.percentile(flux, ONSET_FLOOR_PERCENTILE)),
     )
+    n = len(threshold)
 
     above = frames > threshold
     candidates = np.where(above[1:-1] & (above[1:-1] >= above[:-2]) & (above[1:-1] > above[2:]))[0] + 1
+    floor_ratio = 10.0 ** (-ONSET_MIN_DECAY_DB / 20.0)
     times: list[float] = []
-    last = -10.0
+    last_time = -10.0
+    last_peak = 0.0
+    last_peak_time = 0.0
     for index in candidates:
         # refine to the full-resolution flux so the reported time keeps its sub-frame detail
         lo = max(0, index * hop - hop)
         hi = min(len(flux), index * hop + hop + 1)
         exact = lo + int(np.argmax(flux[lo:hi]))
         t = exact / sr
-        if t - last > min_gap:
-            times.append(float(t))
-            last = t
+        if t - last_time <= min_gap:
+            continue
+        if last_peak > 0.0:
+            span = env[int(last_peak_time * sr):exact]
+            if span.size > 1 and float(span.min()) > last_peak * floor_ratio:
+                # The envelope never fell away from the previous hit: this is its tail (a ringing
+                # body or a decaying ripple), not a new hit.
+                continue
+        times.append(float(t))
+        last_time = t
+        last_peak = float(env[exact]) if exact < len(env) else 0.0
+        last_peak_time = t
     return times
 
 
@@ -391,7 +543,13 @@ def _resolve_torch_device(device: str) -> str:
         return "cpu"
 
 
-def _notes_from_elements(signals: dict[str, dict], element_dir: Path, warnings: list[str]) -> list[tuple[str, float]]:
+def _notes_from_elements(
+    signals: dict[str, dict],
+    element_dir: Path,
+    warnings: list[str],
+    *,
+    kick_sweep_min_hz: float | None = KICK_SWEEP_MIN_HZ,
+) -> tuple[list[tuple[str, float]], dict]:
     """Independent onsets measured inside each element - recall, not authority.
 
     These exist because the models miss hits; but they are found in the same elements
@@ -403,10 +561,18 @@ def _notes_from_elements(signals: dict[str, dict], element_dir: Path, warnings: 
     real kick stem, this same algorithm returned 620 or 427 onsets depending on one number,
     agreeing with itself on only 85 of them.
 
+    The kick additionally has to PASS THE PITCH TEST (`kick_sweep_min_hz`): a kick's
+    fundamental falls, a bass note holds its note.  That is the test which survived where
+    every amplitude rule failed - see KICK_SWEEP_MIN_HZ for the measured numbers, including
+    the section where amplitude said nothing and this said "these are bass notes".
+
     Takes the signals the caller already computed: re-reading six 270 s stems to ask a
     second question about them is 400 MB of I/O for nothing.
     """
+    import numpy as np
+
     notes: list[tuple[str, float]] = []
+    sweep: dict = {}
     for cls in CLASSES:
         signal = signals.get(cls)
         if signal is None:
@@ -419,11 +585,50 @@ def _notes_from_elements(signals: dict[str, dict], element_dir: Path, warnings: 
                 f"{signal['contrast_db']:.1f} dB between the quiet and the loud parts, so its "
                 "onsets depend on the threshold - this class's note times are approximate"
             )
-        for t in _onset_times(signal["detect_band"], signal["sr"], min_gap=refractory):
+        found = _onset_times(signal["detect_band"], signal["sr"], min_gap=refractory)
+        if cls == "kick" and kick_sweep_min_hz is not None and found:
+            kept: list[float] = []
+            dropped: list[float] = []
+            drops: list[float] = []
+            starts: list[float] = []
+            unmeasurable = 0
+            for t in found:
+                start_hz, _low, drop_hz = pitch_drop_hz(signal["sweep_band"], signal["sr"], float(t))
+                if not np.isfinite(drop_hz):
+                    # Cannot be measured (too close to the file's end, or too quiet to have a
+                    # fundamental): left for the arbiter instead of being dropped on a null.
+                    unmeasurable += 1
+                    kept.append(float(t))
+                    continue
+                starts.append(start_hz)
+                drops.append(drop_hz)
+                (kept if drop_hz >= kick_sweep_min_hz else dropped).append(float(t))
+            sweep = {
+                "applied": True,
+                "min_drop_hz": float(kick_sweep_min_hz),
+                "found": len(found),
+                "kept": len(kept),
+                "dropped": len(dropped),
+                "unmeasurable": unmeasurable,
+                "dropped_first_s": [round(d, 3) for d in dropped[:5]],
+                "median_drop_hz": round(float(np.median(drops)), 1) if drops else None,
+                "median_start_hz": round(float(np.median(starts)), 1) if starts else None,
+                "reason": ("a kick's fundamental falls; a bass note holds its note - onsets whose "
+                           "pitch does not fall are the bass leaking into the kick stem"),
+            }
+            if dropped:
+                warnings.append(
+                    f"kick onsets: {len(dropped)} of {len(found)} dropped by the PITCH TEST "
+                    f"(no fall of >= {kick_sweep_min_hz:.0f} Hz within {KICK_SWEEP_SPAN_S * 1000:.0f} ms; "
+                    f"median fall of the kept ones +{np.median(drops):.0f} Hz) - where only the bass "
+                    "plays, these are its notes rather than kicks"
+                )
+            found = kept
+        for t in found:
             notes.append((cls, float(t)))
     if not notes:
         warnings.append(f"detector: no drum elements found in {element_dir}")
-    return notes
+    return notes, sweep
 
 
 # --------------------------------------------------------------------------------------
@@ -640,6 +845,7 @@ def drums_midi_core(
     use_detector: bool = True,
     detector_classes: list[str] | None = None,
     model_classes: list[str] | None = None,
+    kick_sweep_min_hz: float | None = KICK_SWEEP_MIN_HZ,
     device: str = "auto",
 ) -> dict[str, Any]:
     """Build one drum MIDI (and per-class files) from audio and/or existing MIDI sources.
@@ -715,6 +921,7 @@ def drums_midi_core(
 
     signals: dict[str, dict] = {}
     durations: dict[str, Any] = {}
+    sweep_report: dict = {}
     if element_stems_dir:
         element_dir = Path(element_stems_dir).expanduser()
         if not element_dir.is_dir():
@@ -727,7 +934,9 @@ def drums_midi_core(
             signals[cls] = signal
         durations = _duration_mismatch_warning(signals, audio_path, warnings)
         if use_detector:
-            detected = _notes_from_elements(signals, element_dir, warnings)
+            detected, sweep_report = _notes_from_elements(
+                signals, element_dir, warnings, kick_sweep_min_hz=kick_sweep_min_hz
+            )
             if detector_classes:
                 unknown = sorted(set(detector_classes) - set(CLASSES))
                 if unknown:
@@ -740,11 +949,15 @@ def drums_midi_core(
             logger.info("detector: %d onsets", len(detected))
 
     if not notes_by_source:
+        # The guard can remove every onset (a stem with no kick in it at all), and then the
+        # reason has to be readable: "no source produced any notes" plus the pitch test's own
+        # numbers, not a bare failure.
         return {
             "ok": False,
             "reason": "no source produced any notes",
             "warnings": warnings,
             "sources": {},
+            "kick_pitch_test": sweep_report,
         }
 
     # a fusion needs a step to cluster with; without bpm fall back to a 1/16 at 120 BPM
@@ -815,17 +1028,21 @@ def drums_midi_core(
             "lone_support_db": lone_support_db,
         },
         "detector_classes": sorted(detector_classes) if detector_classes else "all",
-        "model_classes": sorted(model_classes) if model_classes else "all",            # what the onsets were MEASURED in: a band whose hits do not stand above a busy
-            # floor gives a count that is a property of the constants, not of the drum
-            "detect_bands": {
-                cls: {
-                    "hz": signal["detect_band_hz"],
-                    "refractory_ms": round(refractory_for_band(float(signal["detect_band_hz"][0])) * 1000.0, 1),
-                    "contrast_db": signal["contrast_db"],
-                    "stable": signal["contrast_db"] >= LOW_CONTRAST_DB,
-                }
-                for cls, signal in sorted(signals.items())
-            },        "model": model_info,
+        "model_classes": sorted(model_classes) if model_classes else "all",
+        # the kick's bass guard: what the pitch test removed, and why (see KICK_SWEEP_MIN_HZ)
+        "kick_pitch_test": sweep_report,
+        # what the onsets were MEASURED in: a band whose hits do not stand above a busy
+        # floor gives a count that is a property of the constants, not of the drum
+        "detect_bands": {
+            cls: {
+                "hz": signal["detect_band_hz"],
+                "refractory_ms": round(refractory_for_band(float(signal["detect_band_hz"][0])) * 1000.0, 1),
+                "contrast_db": signal["contrast_db"],
+                "stable": signal["contrast_db"] >= LOW_CONTRAST_DB,
+            }
+            for cls, signal in sorted(signals.items())
+        },
+        "model": model_info,
         "sources": {label: len(notes) for label, notes in notes_by_source.items()},
         "warnings": warnings,
     }

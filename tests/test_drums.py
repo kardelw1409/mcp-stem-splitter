@@ -156,6 +156,119 @@ class TestOnsetDetection(unittest.TestCase):
                             result["warnings"])
 
 
+class TestKickPitchTest(unittest.TestCase):
+    """A kick's fundamental FALLS; a bass note holds its note.
+
+    This is the test that survived where every amplitude rule failed.  Measured on a real
+    neurofunk stem (383 onsets) with the bass stem's own onsets as the control:
+
+        kick onsets   median fall +35 Hz, 68 % >= 10 Hz, fundamental starts ~104 Hz
+        bass onsets   median fall   0 Hz, 57 % <  5 Hz
+
+    and in the one section that is measurably a leak (the kick stem correlates +0.756 with the
+    bass stem and sits 10.4 dB below it) the onsets start at 37.7 Hz with 73 % of them flat.
+    """
+
+    def _hit(self, sr, t, *, f_start, f_end, dur=0.25, amp=1.0):
+        import numpy as np
+
+        n = int(dur * sr)
+        tt = np.arange(n) / sr
+        # instantaneous frequency sliding from f_start to f_end over the first 60 ms
+        sweep = np.clip(tt / 0.060, 0.0, 1.0)
+        freq = f_start + (f_end - f_start) * sweep
+        phase = 2 * np.pi * np.cumsum(freq) / sr
+        return (amp * np.sin(phase) * np.exp(-tt / 0.10)).astype(np.float32)
+
+    def _track(self, sr, hits):
+        import numpy as np
+
+        out = np.zeros(int(sr * 6.0), dtype=np.float32)
+        for t, kwargs in hits:
+            hit = self._hit(sr, t, **kwargs)
+            a = int(t * sr)
+            out[a:a + len(hit)] += hit
+        return out
+
+    def test_a_falling_kick_passes_and_a_flat_bass_note_does_not(self):
+        import numpy as np
+
+        from mcp_stem_splitter.drums import KICK_SWEEP_MIN_HZ, pitch_drop_hz
+
+        sr = 8000
+        kick = self._hit(sr, 0.0, f_start=110.0, f_end=50.0)
+        bass = self._hit(sr, 0.0, f_start=70.0, f_end=70.0)
+        _k0, _k1, kick_drop = pitch_drop_hz(kick, sr, 0.0)
+        _b0, _b1, bass_drop = pitch_drop_hz(bass, sr, 0.0)
+        self.assertGreater(kick_drop, KICK_SWEEP_MIN_HZ, kick_drop)
+        self.assertLess(bass_drop, KICK_SWEEP_MIN_HZ, bass_drop)
+        self.assertGreater(np.isfinite([kick_drop, bass_drop]).all(), 0)
+
+    def test_the_element_report_says_what_the_pitch_test_removed(self):
+        """The count must be explainable: the report carries found/kept/dropped and the median
+        fall, so "fewer kicks" can be told apart from "the guard ate them"."""
+        import numpy as np
+        import soundfile as sf
+
+        from mcp_stem_splitter.drums import drums_midi_core
+
+        sr = 8000
+        with tempfile.TemporaryDirectory() as tmp:
+            elements = Path(tmp) / "elements"
+            elements.mkdir()
+            kicks = self._track(sr, [(t, {"f_start": 110.0, "f_end": 50.0}) for t in (0.5, 1.5, 2.5, 3.5)])
+            basses = self._track(sr, [(t, {"f_start": 70.0, "f_end": 70.0}) for t in (1.0, 2.0, 3.0)])
+            sf.write(str(elements / "kick.wav"), kicks + basses, sr)
+
+            result = drums_midi_core(element_stems_dir=str(elements), output_dir=str(Path(tmp) / "out"),
+                                     bpm=120.0, use_detector=True, allow_model_download=False,
+                                     split_by_class=False)
+            report = result["kick_pitch_test"]
+            self.assertTrue(report["applied"])
+            self.assertEqual(report["min_drop_hz"], 10.0)
+            self.assertGreaterEqual(report["kept"], 3, report)
+            self.assertGreaterEqual(report["dropped"], 1, report)
+            # found = kept + dropped + unmeasurable, always: the counts have to add up
+            self.assertEqual(report["found"],
+                             report["kept"] + report["dropped"] + report["unmeasurable"], report)
+            self.assertGreater(report["kept"], report["dropped"], report)
+            self.assertIsNotNone(report["median_drop_hz"])
+            self.assertTrue(any("PITCH TEST" in w for w in result["warnings"]), result["warnings"])
+
+    def test_the_guard_can_be_switched_off(self):
+        import soundfile as sf
+
+        from mcp_stem_splitter.drums import drums_midi_core
+
+        sr = 8000
+        with tempfile.TemporaryDirectory() as tmp:
+            elements = Path(tmp) / "elements"
+            elements.mkdir()
+            only_bass = self._track(sr, [(t, {"f_start": 70.0, "f_end": 70.0}) for t in (0.5, 1.5, 2.5, 3.5)])
+            sf.write(str(elements / "kick.wav"), only_bass, sr)
+
+            guarded = drums_midi_core(element_stems_dir=str(elements), output_dir=str(Path(tmp) / "a"),
+                                      bpm=120.0, allow_model_download=False, split_by_class=False)
+            off = drums_midi_core(element_stems_dir=str(elements), output_dir=str(Path(tmp) / "b"),
+                                  bpm=120.0, allow_model_download=False, split_by_class=False,
+                                  kick_sweep_min_hz=None)
+            # with the guard on there is nothing left to write, and the reason is readable
+            self.assertFalse(guarded["ok"])
+            self.assertIn("no source", guarded["reason"])
+            report = guarded["kick_pitch_test"]
+            self.assertEqual(report["kept"], 0, report)
+            self.assertEqual(report["dropped"], report["found"], report)
+            # the medians describe the material, so they are filled even when nothing is kept:
+            # "these onsets start at 70 Hz and do not fall" IS the diagnosis
+            self.assertGreater(report["median_start_hz"], 60.0, report)
+            self.assertLess(report["median_drop_hz"], report["min_drop_hz"], report)
+            self.assertTrue(any("PITCH TEST" in w for w in guarded["warnings"]), guarded["warnings"])
+            # switched off, the same file yields the notes it always did
+            self.assertTrue(off["ok"])
+            self.assertEqual(off["notes"]["by_class"]["kick"], report["found"], off["notes"])
+            self.assertEqual(off["kick_pitch_test"], {})
+
+
 class TestPitchVocabulary(unittest.TestCase):
     def test_kick_has_both_pitches(self):
         from mcp_stem_splitter.drums import PITCH_CLASS
