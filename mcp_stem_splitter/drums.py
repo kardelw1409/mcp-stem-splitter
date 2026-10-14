@@ -476,6 +476,7 @@ def drums_midi_core(
     split_by_class: bool = True,
     use_detector: bool = True,
     detector_classes: list[str] | None = None,
+    model_classes: list[str] | None = None,
     device: str = "auto",
 ) -> dict[str, Any]:
     """Build one drum MIDI (and per-class files) from audio and/or existing MIDI sources.
@@ -490,6 +491,15 @@ def drums_midi_core(
     (measured: 16 and 6 over a whole track), while the detector is productive exactly
     there - and over-productive on toms, whose analysis band overlaps kick and snare.
     Restricting the detector to the classes the models miss is the honest middle.
+
+    `model_classes` restricts the OTHER direction, and the kick is why it exists. On a
+    neurofunk track the isolated kick element was measured to contain ~620 hits (a
+    straight every-8th kick in places) while the model proposed 110 notes, of which 47
+    had no hit within 30 ms of any element onset: the model both invented kicks and
+    missed most real ones. A class whose physical source is available and clean should
+    be taken from that source alone rather than arbitrated with a model that is wrong
+    about it - pass model_classes=["snare", "hihat"] with
+    detector_classes=["kick", "tom", "cymbal"] for exactly that split.
     """
     _configure_logging()
 
@@ -497,6 +507,13 @@ def drums_midi_core(
         raise ValueError(f"mode must be one of: {', '.join(MODES)}")
     if audio_path is None and not extra_midi and not element_stems_dir:
         raise ValueError("at least one source is required: audio_path, extra_midi or element_stems_dir")
+    # Validated EAGERLY, like detector_classes: a typo must fail on every path, not only on
+    # the one where the model happens to run (with no audio_path the check below never fired,
+    # so `model_classes=["kikc"]` was accepted in silence).
+    if model_classes:
+        unknown = sorted(set(model_classes) - set(CLASSES))
+        if unknown:
+            raise ValueError(f"model_classes has unknown classes: {unknown}; valid: {list(CLASSES)}")
 
     output_dir_p = Path(output_dir).expanduser()
     output_dir_p.mkdir(parents=True, exist_ok=True)
@@ -515,6 +532,10 @@ def drums_midi_core(
             device=device,
             allow_download=allow_model_download,
         )
+        if mapped and model_classes:
+            before = len(mapped)
+            mapped = [item for item in mapped if item[0] in set(model_classes)]
+            logger.info("model restricted to %s: %d of %d notes kept", model_classes, len(mapped), before)
         if mapped:
             notes_by_source["adt_of"] = mapped
         logger.info("adt_of: %d notes", len(mapped))
@@ -631,6 +652,7 @@ def drums_midi_core(
             "lone_support_db": lone_support_db,
         },
         "detector_classes": sorted(detector_classes) if detector_classes else "all",
+        "model_classes": sorted(model_classes) if model_classes else "all",
         "model": model_info,
         "sources": {label: len(notes) for label, notes in notes_by_source.items()},
         "warnings": warnings,

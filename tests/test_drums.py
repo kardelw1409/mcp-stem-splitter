@@ -211,6 +211,84 @@ class TestToolContract(unittest.TestCase):
             for cls in ("kick", "snare", "hihat", "cymbal"):
                 self.assertEqual(allowed["notes"]["by_class"][cls], 0, cls)
 
+    def test_rejects_unknown_model_class(self):
+        """A typo in model_classes must fail on EVERY path.
+
+        The first version validated it inside the model branch, so `model_classes=["kikc"]`
+        passed silently whenever there was no audio_path - a typo that quietly disabled the
+        restriction instead of switching it off out loud.
+        """
+        import pretty_midi
+
+        from mcp_stem_splitter.drums import drums_midi_core
+
+        with tempfile.TemporaryDirectory() as tmp:
+            source = Path(tmp) / "src.mid"
+            midi = pretty_midi.PrettyMIDI()
+            drums = pretty_midi.Instrument(program=0, is_drum=True)
+            drums.notes.append(pretty_midi.Note(velocity=100, pitch=35, start=1.0, end=1.05))
+            midi.instruments.append(drums)
+            midi.write(str(source))
+
+            with self.assertRaises(ValueError) as ctx:
+                drums_midi_core(extra_midi=[str(source)], output_dir=str(Path(tmp) / "out"),
+                                bpm=120.0, model_classes=["kikc"])
+            self.assertIn("kikc", str(ctx.exception))
+
+    def test_model_classes_is_reported_on_every_path(self):
+        """The report must say what the model was allowed to propose, or the reader cannot
+        tell "no kicks" from "kicks were never asked for"."""
+        import pretty_midi
+
+        from mcp_stem_splitter.drums import drums_midi_core
+
+        with tempfile.TemporaryDirectory() as tmp:
+            source = Path(tmp) / "src.mid"
+            midi = pretty_midi.PrettyMIDI()
+            drums = pretty_midi.Instrument(program=0, is_drum=True)
+            drums.notes.append(pretty_midi.Note(velocity=100, pitch=35, start=1.0, end=1.05))
+            midi.instruments.append(drums)
+            midi.write(str(source))
+
+            out = Path(tmp) / "out"
+            unrestricted = drums_midi_core(extra_midi=[str(source)], output_dir=str(out / "a"), bpm=120.0)
+            restricted = drums_midi_core(extra_midi=[str(source)], output_dir=str(out / "b"), bpm=120.0,
+                                         model_classes=["snare", "hihat"])
+            self.assertEqual(unrestricted["model_classes"], "all")
+            self.assertEqual(restricted["model_classes"], ["hihat", "snare"])
+
+    def test_model_classes_drops_the_model_notes_for_excluded_classes(self):
+        """Why the parameter exists: on a neurofunk track the isolated kick element held
+        ~620 hits while the model proposed 110, of which 47 matched NO element onset - the
+        model both invented kicks and missed most real ones. A class with a clean physical
+        source must be able to come from that source alone, so the model's notes for it are
+        dropped BEFORE arbitration instead of being voted on.
+
+        The model call is patched: the mechanism under test is the filter, not the weights.
+        """
+        from unittest import mock
+
+        import numpy as np
+        import soundfile as sf
+
+        from mcp_stem_splitter import drums as drums_mod
+
+        with tempfile.TemporaryDirectory() as tmp:
+            audio = Path(tmp) / "mix.wav"
+            sf.write(str(audio), np.zeros(8000, dtype=np.float32), 8000)
+            fake = [("kick", 0.5), ("kick", 1.0), ("snare", 0.5), ("hihat", 1.0)]
+            with mock.patch.object(drums_mod, "_notes_from_adt_of",
+                                   return_value=(fake, {"source": "patched", "device": "none"})):
+                result = drums_mod.drums_midi_core(
+                    audio_path=str(audio), output_dir=str(Path(tmp) / "out"),
+                    bpm=120.0, model_classes=["snare", "hihat"],
+                    use_detector=False, allow_model_download=False)
+
+            self.assertEqual(result["sources"]["adt_of"], 2, "the model's kicks must be gone")
+            self.assertEqual(result["notes"]["by_class"]["kick"], 0)
+            self.assertEqual(result["notes"]["by_class"]["snare"], 1)
+            self.assertEqual(result["notes"]["by_class"]["hihat"], 1)
+
     def test_per_class_files_are_written(self):
         import pretty_midi
 
