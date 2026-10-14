@@ -8,9 +8,10 @@ import subprocess
 import zipfile
 from pathlib import Path
 import re
-from typing import Any, Literal, TypedDict
+from typing import Annotated, Any, Literal, TypedDict
 
 from mcp.server.fastmcp import FastMCP
+from pydantic import Field
 
 logger = logging.getLogger("mcp_stem_splitter")
 
@@ -449,20 +450,95 @@ def split_vocals_only_core(
 
 @mcp.tool("drums_midi")
 def drums_midi(
-    audio_path: str | None = None,
-    output_dir: str = "drums_midi",
-    element_stems_dir: str | None = None,
-    extra_midi: list[str] | None = None,
-    bpm: float | None = None,
-    grid_origin_s: float | None = None,
-    mode: str = "balanced",
-    quantize_to_grid: bool = True,
-    max_shift_ms: float = 60.0,
-    split_by_class: bool = True,
-    use_detector: bool = True,
-    detector_classes: list[str] | None = None,
-    device: str = "auto",
+    audio_path: Annotated[str | None, Field(description="Audio to transcribe with ADTOF (no separation needed). At least one of audio_path / extra_midi / element_stems_dir must be given.")] = None,
+    output_dir: Annotated[str, Field(description="Directory for the MIDI files; created if missing.")] = "drums_midi",
+    element_stems_dir: Annotated[str | None, Field(description="Folder with the separated drum elements (kick/snare/hh/toms/ride/crash) of the SAME audio. They are the arbiter of every note and the source of velocity.")] = None,
+    extra_midi: Annotated[list[str] | None, Field(description="Additional drum MIDI files to vote alongside ADTOF, e.g. the output of a second transcription model.")] = None,
+    bpm: Annotated[float | None, Field(description="Tempo for 1/16 quantisation (use the MEASURED tempo). Omit to skip quantisation entirely.")] = None,
+    grid_origin_s: Annotated[float | None, Field(description="Measured grid phase in seconds (e.g. grid.origin_s from the audiocpp manifest). Prefer this over estimating from the notes: an estimate cannot fix a systematic offset.")] = None,
+    mode: Annotated[str, Field(description="balanced (default) | strict | consensus | full - how strictly sources must agree and the element support the note.")] = "balanced",
+    quantize_to_grid: Annotated[bool, Field(description="Pull notes onto the 1/16 grid when bpm is given.")] = True,
+    max_shift_ms: Annotated[float, Field(description="How far quantisation may move a note; anything further away is left untouched.")] = 60.0,
+    split_by_class: Annotated[bool, Field(description="Also write one MIDI file per drum class (kick/snare/hihat/tom/cymbal) so a DAW can place them as separate items.")] = True,
+    use_detector: Annotated[bool, Field(description="Also detect onsets inside the elements and let them vote. Turn off for the most conservative result.")] = True,
+    detector_classes: Annotated[list[str] | None, Field(description='Restrict the detector to these classes, e.g. ["tom","cymbal"]. Recommended: a 5-class model has almost no toms/cymbals (16 and 6 over a 270 s track), while an unrestricted detector roughly doubles total density.')] = None,
+    device: Annotated[str, Field(description="Torch device for the transcription model: auto | cpu | cuda | cuda:N.")] = "auto",
 ) -> dict[str, Any]:
+    """Transcribe a track's drum part to MIDI - one file per drum class plus a combined file.
+
+    Use this when the user wants drum MIDI, wants the drum part as separate items/tracks,
+    or says the drum part is missing or does not sit on the grid. This tool does NOT
+    separate audio: pass the already-separated drum elements in element_stems_dir.
+
+    HOW A NOTE IS ACCEPTED
+    Sources vote; the separated elements arbitrate.
+      * audio_path is transcribed by ADTOF (a specialist drum-transcription model that
+        works on the mix and uses its own per-class thresholds); measured cost is about
+        2-4 s on GPU and up to ~10 s on CPU per 90 s of audio.
+      * extra_midi files vote as well (any number of sources, each optional).
+      * unless use_detector=False, onsets are also detected inside the elements.
+      * a note must then be SUPPORTED by the matching element: louder than that element's
+        OWN median level (self-calibrating; no absolute threshold is invented). Two
+        sources agreeing are accepted from ~1.5 dB above that median; a lone source needs
+        a clearer margin (~3 dB).
+    Measured reason for this shape: one model's notes are only ~49 % supported by the
+    audio, and even four models agreeing leave ~24 % unsupported - they share a training
+    bias. The elements are the only physical reference that is independent of the models.
+    Without element_stems_dir there is nothing to verify against; the report then says so
+    (velocity_reference.source is "none") instead of pretending the notes were checked.
+
+    MODES (precision vs recall)
+      consensus - any 2+ sources agree, no physical check
+      strict    - 2+ agree AND the element supports it
+      balanced  - as strict, or a lone source clearly above the element level (default)
+      full      - anything the element supports (recall first)
+    Without element_stems_dir there is nothing to verify against: "full" then keeps every
+    proposed note and "strict" keeps only agreed ones - the mode switches from filtering
+    on physics to filtering on votes alone, which the report states explicitly.
+    Note: strict needs two independent sources, so with a single model plus the detector
+    it mainly keeps hi-hats. It is not a synonym for "better".
+
+    WHICH SOURCE COVERS WHICH CLASS (measured, full 270 s drum & bass track)
+    A 5-class transcription model has almost no toms and cymbals (16 and 6 notes over the
+    whole track - its vocabulary has no ride/crash), while the detector is productive
+    exactly there. Recommended hybrid: detector_classes=["tom", "cymbal"] -> 2796 notes
+    (kick 110, snare 227, hihat 730 from the model; tom 565, cymbal 1164 from the
+    detector), against 4140 notes with an unrestricted detector and 1089 with none.
+    Density matters musically: 4140 notes is ~22 per bar, which no drummer plays.
+
+    GRID
+    With bpm set, notes are pulled to the nearest 1/16 within max_shift_ms. Pass
+    grid_origin_s whenever a measured grid phase exists - estimating it from the notes
+    cannot correct a systematic offset and degenerates on short files. The report states
+    which was used (grid.origin_source: "explicit" or "estimated_from_notes").
+
+    VELOCITY IS PER CLASS (the models are not equally good at it)
+      kick   - flat 100: model velocity correlates +0.09 with the audio (noise); a kick
+               is a single-velocity sample trigger
+      snare  - measured 88..124 (correlation +0.65 - real dynamics, e.g. ghost notes)
+      hihat  - measured 36..127 (+0.45; carries the groove)
+      tom / cymbal - measured 70..120 / 84..120 (compressed: less reliable)
+    Dynamics come from the element's energy at each note, so they require
+    element_stems_dir; otherwise every class gets one neutral value.
+
+    ELEMENT FILES
+    element_stems_dir must hold the elements of the SAME audio: kick, snare, hh, toms,
+    ride, crash. Both kick.wav and drumsep_(kick)_....wav style names are recognised;
+    cymbal sums ride+crash. A missing element costs only that class and is reported.
+
+    OUTPUT
+    <output_dir>/drums.mid plus drums_kick.mid, drums_snare.mid, drums_hihat.mid,
+    drums_tom.mid, drums_cymbal.mid - each a GM drum track (kick 36, snare 38, hihat 42,
+    tom 45, cymbal 49) so the DAW can place them as separate items.
+    The result also carries notes{total,by_class,clusters_considered},
+    velocity{...}, velocity_reference, grid{...}, arbiter{elements_used,durations,...},
+    sources and detector_classes.
+
+    ALWAYS READ warnings BEFORE REPORTING SUCCESS: they flag a missing element, a source
+    that could not be read, and elements shorter than the audio (in which case every note
+    past their end is dropped - the stems and the mix are not from the same file).
+    ok=false means no source produced a single note.
+    """
     from .drums import drums_midi_core
 
     return drums_midi_core(

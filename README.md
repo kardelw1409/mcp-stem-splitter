@@ -39,6 +39,34 @@ drums_midi(
 
 Returns `{ midi: { combined, by_class: {kick, snare, hihat, tom, cymbal} }, notes, velocity, grid, arbiter, sources, warnings }`.
 
+Recommended call (the hybrid measured on a 270 s drum & bass track):
+
+```python
+drums_midi(
+    audio_path=r"...\mix.wav",
+    element_stems_dir=r"...\drumsep_out",
+    output_dir=r"...\drums_midi",
+    bpm=172.0135,                     # MEASURED tempo
+    grid_origin_s=0.1595,             # MEASURED phase, e.g. from the audiocpp manifest
+    detector_classes=["tom", "cymbal"],   # see below
+)
+```
+
+Why restrict the detector: a 5-class transcription model produced 110 kicks / 227 snares /
+730 hi-hats but only **16 toms and 6 cymbals** over the whole track (its vocabulary has no
+ride/crash), while onset detection inside the elements is productive exactly there. The
+same run with an unrestricted detector gives 4140 notes (~22 per bar - more than a drummer
+plays); with none, 1089 and no toms/cymbals. The hybrid gives 2796.
+
+What to read in the result before calling it a success:
+
+| field | meaning |
+| --- | --- |
+| `warnings` | a missing element, an unreadable source, or **elements shorter than the audio** (then every note past their end is dropped - stems and mix are not from the same files) |
+| `grid.origin_source` | `explicit` when you passed `grid_origin_s`, `estimated_from_notes` otherwise (an estimate cannot fix a systematic offset) |
+| `velocity_reference.source` | `none` means no elements were given: every class got one neutral value, **not** dynamics |
+| `notes.by_class` | where the notes came from - use it to spot a class that a source cannot produce at all |
+
 Why more than one model:
 
 * a single model's notes are only about half supported by the audio (measured),
