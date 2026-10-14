@@ -387,10 +387,21 @@ def _assign_velocity(records: list[dict], signals: dict) -> None:
             rec["velocity"] = int(round(lo + (hi - lo) * float(value)))
 
 
-def _write_midi(records: list[dict], path: Path, pitch_map: dict[str, int]) -> None:
+def _write_midi(
+    records: list[dict], path: Path, pitch_map: dict[str, int], bpm: float | None = None
+) -> dict[str, Any]:
+    """Write one drum part, carrying the PROJECT tempo when it is known.
+
+    This is not cosmetic. A DAW plays a MIDI item's ticks as beats at the project
+    tempo (`IGNTEMPO 0` in REAPER), so a file left at pretty_midi's default 120 in a
+    172 bpm project plays 1.43x too fast and ends far early - measured on a real
+    bundle: a 120 bpm drums.mid ended at 186.74 s of project time instead of
+    267.66 s. Passing `initial_tempo` makes the seconds -> ticks conversion use the
+    project tempo, which is the part a plain `set_tempo` afterwards cannot fix.
+    """
     import pretty_midi
 
-    midi = pretty_midi.PrettyMIDI()
+    midi = pretty_midi.PrettyMIDI(initial_tempo=float(bpm) if bpm else 120.0)
     drums = pretty_midi.Instrument(program=0, is_drum=True)
     for rec in sorted(records, key=lambda r: r["onset"]):
         start = max(0.0, float(rec["onset"]))
@@ -405,6 +416,11 @@ def _write_midi(records: list[dict], path: Path, pitch_map: dict[str, int]) -> N
     midi.instruments.append(drums)
     path.parent.mkdir(parents=True, exist_ok=True)
     midi.write(str(path))
+    return {
+        "bpm": round(float(bpm), 4) if bpm else 120.0,
+        "source": "argument" if bpm else "default_120",
+        "notes": len(records),
+    }
 
 
 # --------------------------------------------------------------------------------------
@@ -561,7 +577,12 @@ def drums_midi_core(
 
     pitch_map = dict(DEFAULT_OUTPUT_PITCH)
     combined_path = (output_dir_p / "drums.mid").resolve()
-    _write_midi(kept, combined_path, pitch_map)
+    tempo_info = _write_midi(kept, combined_path, pitch_map, bpm=bpm)
+    if not bpm:
+        warnings.append(
+            "no bpm given: the MIDI files carry 120 bpm, so the item's length in a project "
+            "of another tempo will not match the audio (pass the measured bpm)"
+        )
 
     per_class: dict[str, str] = {}
     if split_by_class:
@@ -570,7 +591,7 @@ def drums_midi_core(
             if not class_records:
                 continue
             class_path = (output_dir_p / f"drums_{cls}.mid").resolve()
-            _write_midi(class_records, class_path, pitch_map)
+            _write_midi(class_records, class_path, pitch_map, bpm=bpm)
             per_class[cls] = str(class_path)
 
     by_class: dict[str, int] = {cls: 0 for cls in CLASSES}
@@ -589,6 +610,7 @@ def drums_midi_core(
         "audio": str(Path(audio_path).expanduser().resolve()) if audio_path else None,
         "output_dir": str(output_dir_p.resolve()),
         "midi": {"combined": str(combined_path), **({} if not split_by_class else {"by_class": per_class})},
+        "midi_tempo": tempo_info,
         "notes": {"total": len(kept), "by_class": by_class, "clusters_considered": len(clusters)},
         "velocity": {cls: {"values": len(values), "range": [values[0], values[-1]] if values else None}
                      for cls, values in velocity_by_class.items()},

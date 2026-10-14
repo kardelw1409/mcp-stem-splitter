@@ -480,7 +480,7 @@ def drums_midi(
     output_dir: Annotated[str, Field(description="Directory for the MIDI files; created if missing.")] = "drums_midi",
     element_stems_dir: Annotated[str | None, Field(description="Folder with the separated drum elements (kick/snare/hh/toms/ride/crash) of the SAME audio. They are the arbiter of every note and the source of velocity.")] = None,
     extra_midi: Annotated[list[str] | None, Field(description="Additional drum MIDI files to vote alongside ADTOF, e.g. the output of a second transcription model.")] = None,
-    bpm: Annotated[float | None, Field(description="Tempo for 1/16 quantisation (use the MEASURED tempo). Omit to skip quantisation entirely.")] = None,
+    bpm: Annotated[float | None, Field(description="Tempo for 1/16 quantisation AND the tempo written into the MIDI files. Pass the MEASURED tempo: a DAW plays MIDI ticks as beats at the project tempo, so a part left at the 120 default plays 1.43x too fast in a 172 bpm project (measured: an 81 s deficit). Omit only if you do not care about the item matching the audio length.")] = None,
     grid_origin_s: Annotated[float | None, Field(description="Measured grid phase in seconds (e.g. grid.origin_s from the audiocpp manifest). Prefer this over estimating from the notes: an estimate cannot fix a systematic offset.")] = None,
     mode: Annotated[str, Field(description="balanced (default) | strict | consensus | full - how strictly sources must agree and the element support the note.")] = "balanced",
     adt_of_thresholds: Annotated[list[float] | None, Field(description="Per-class onset thresholds for ADTOF, in class order [kick, snare, tom, hihat, cymbal]. Omit for the model defaults; the measured set [0.176, 0.192, 0.32, 0.132, 0.24] trades a little precision for more hits (validated with the element support test).")] = None,
@@ -548,6 +548,14 @@ def drums_midi(
     grid_origin_s whenever a measured grid phase exists - estimating it from the notes
     cannot correct a systematic offset and degenerates on short files. The report states
     which was used (grid.origin_source: "explicit" or "estimated_from_notes").
+
+    TEMPO - ALWAYS PASS IT
+    bpm is written into the files as their tempo, and that is not cosmetic: a DAW plays
+    a MIDI item's ticks as beats at the PROJECT tempo, so a file that says 120 in a
+    172 bpm project plays 1.43x too fast and ends far early (measured: such a drum part
+    ended at 186.7 s of project time instead of 267.7 s, an 81 s deficit). With no bpm
+    the files carry 120, the report says midi_tempo.source="default_120" and a warning
+    is raised, because the length then cannot match the audio.
 
     VELOCITY IS PER CLASS (the models are not equally good at it)
       kick   - flat 100: model velocity correlates +0.09 with the audio (noise); a kick

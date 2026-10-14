@@ -268,5 +268,104 @@ class TestToolContract(unittest.TestCase):
             self.assertEqual(result["arbiter"]["durations"], {})
 
 
+class TestMidiTempo(unittest.TestCase):
+    """The file must carry the PROJECT tempo, in the ticks themselves.
+
+    A DAW plays a MIDI item's ticks as beats at the project tempo, so a file left at
+    pretty_midi's default 120 in a 172 bpm project plays 1.43x too fast. Measured on a
+    real bundle: such a file ended at 186.74 s of project time instead of 267.66 s.
+    Writing a `set_tempo` afterwards does not help - the seconds -> ticks conversion
+    has to happen with the right tempo, which is what `initial_tempo` changes.
+    """
+
+    def test_seconds_land_on_ticks_of_the_project_tempo(self):
+        import pretty_midi
+
+        from mcp_stem_splitter.drums import _write_midi
+
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "one.mid"
+            info = _write_midi([{"class": "kick", "onset": 1.0}], path, {"kick": 36}, bpm=172.0)
+
+            self.assertEqual(info["bpm"], 172.0)
+            self.assertEqual(info["source"], "argument")
+
+            parsed = pretty_midi.PrettyMIDI(str(path))
+            self.assertAlmostEqual(parsed.get_tempo_changes()[1][0], 172.0, places=3)
+            # 1.0 s at 172 bpm is 172/60 beats. A note is stored in whole TICKS, so the
+            # tolerance is one tick (1/resolution beats) - asserting "3 decimal places"
+            # fails on the 1/3 of a tick that rounding costs.
+            beats = parsed.time_to_tick(1.0) / parsed.resolution
+            self.assertAlmostEqual(beats, 1.0 / (60.0 / 172.0), delta=1.0 / parsed.resolution)
+            # the tick is the file's unit: one tick at 172 bpm / 220 ppq is 1.59 ms
+            self.assertLess(abs(parsed.instruments[0].notes[0].start - 1.0), 60.0 / (172.0 * parsed.resolution))
+
+    def test_a_different_tempo_moves_the_ticks_not_the_seconds(self):
+        import pretty_midi
+
+        from mcp_stem_splitter.drums import _write_midi
+
+        with tempfile.TemporaryDirectory() as tmp:
+            slow, fast = Path(tmp) / "slow.mid", Path(tmp) / "fast.mid"
+            _write_midi([{"class": "kick", "onset": 2.0}], slow, {"kick": 36}, bpm=120.0)
+            _write_midi([{"class": "kick", "onset": 2.0}], fast, {"kick": 36}, bpm=172.0)
+
+            slow_midi = pretty_midi.PrettyMIDI(str(slow))
+            fast_midi = pretty_midi.PrettyMIDI(str(fast))
+            self.assertAlmostEqual(fast_midi.time_to_tick(2.0) / slow_midi.time_to_tick(2.0), 172.0 / 120.0, places=3)
+            # seconds do not move: the note survives within the file's own tick grid
+            # (one tick at 172 bpm / 220 ppq is 1.59 ms, at 120 bpm 2.27 ms)
+            for parsed, bpm in ((slow_midi, 120.0), (fast_midi, 172.0)):
+                start = parsed.instruments[0].notes[0].start
+                self.assertLess(abs(start - 2.0), 60.0 / (bpm * parsed.resolution),
+                                f"a {bpm:g} bpm file lost its seconds: {start}")
+
+    def test_no_bpm_is_reported_and_warned_about(self):
+        import pretty_midi
+
+        from mcp_stem_splitter.drums import drums_midi_core
+
+        with tempfile.TemporaryDirectory() as tmp:
+            source = Path(tmp) / "src.mid"
+            midi = pretty_midi.PrettyMIDI()
+            drums = pretty_midi.Instrument(program=0, is_drum=True)
+            drums.notes.append(pretty_midi.Note(velocity=100, pitch=35, start=1.0, end=1.05))
+            midi.instruments.append(drums)
+            midi.write(str(source))
+
+            result = drums_midi_core(audio_path=None, output_dir=str(Path(tmp) / "out"),
+                                     extra_midi=[str(source)], bpm=None)
+
+            self.assertTrue(result["ok"])
+            self.assertEqual(result["midi_tempo"], {"bpm": 120.0, "source": "default_120", "notes": 1})
+            self.assertTrue(any("120 bpm" in w for w in result["warnings"]),
+                            f"a file that cannot know the project tempo must say so: {result['warnings']}")
+
+    def test_the_reported_tempo_is_the_one_the_file_has(self):
+        import pretty_midi
+
+        from mcp_stem_splitter.drums import drums_midi_core
+
+        with tempfile.TemporaryDirectory() as tmp:
+            source = Path(tmp) / "src.mid"
+            midi = pretty_midi.PrettyMIDI()
+            drums = pretty_midi.Instrument(program=0, is_drum=True)
+            drums.notes.append(pretty_midi.Note(velocity=100, pitch=35, start=1.0, end=1.05))
+            midi.instruments.append(drums)
+            midi.write(str(source))
+
+            result = drums_midi_core(audio_path=None, output_dir=str(Path(tmp) / "out"),
+                                     extra_midi=[str(source)], bpm=172.0135)
+
+            self.assertEqual(result["midi_tempo"]["bpm"], 172.0135)
+            self.assertEqual(result["midi_tempo"]["source"], "argument")
+            # and every file it wrote agrees, not just the combined one
+            paths = [result["midi"]["combined"], *result["midi"]["by_class"].values()]
+            self.assertGreaterEqual(len(paths), 2)
+            for path in paths:
+                tempo = pretty_midi.PrettyMIDI(path).get_tempo_changes()[1][0]
+                self.assertAlmostEqual(tempo, 172.0135, places=3, msg=path)
+
+
 if __name__ == "__main__":
     unittest.main()
