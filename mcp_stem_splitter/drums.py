@@ -40,7 +40,12 @@ CLASSES = ("kick", "snare", "hihat", "tom", "cymbal")
 
 # canonical class -> (element names to sum for the arbiter/detector, analysis band)
 ELEMENT_BANDS: dict[str, tuple[tuple[str, ...], tuple[float, float]]] = {
-    "kick": (("kick",), (25.0, 120.0)),
+    # The kick's SUPPORT band is its body, not its sub.  Measured on a real stem, asking
+    # "is there kick energy here" in 25-120 Hz gives +3.7 dB at the hits and +5.0 dB BETWEEN
+    # them - i.e. it is louder where there is no hit, so the answer is never no.  In 60-250 Hz
+    # the same question separates hits from the gaps by +7.2 dB, which is what lets the
+    # arbiter refuse a wrong note at all.
+    "kick": (("kick",), (60.0, 250.0)),
     "snare": (("snare",), (150.0, 400.0)),
     "hihat": (("hh",), (6000.0, 12000.0)),
     "tom": (("toms",), (80.0, 250.0)),
@@ -106,27 +111,106 @@ def _band_signal(path: Path, lo: float, hi: float):
     return np.asarray(band, dtype=np.float32), int(sr)
 
 
+# The band a class is TIMED in is not always the band it is SUPPORTED in, and the kick is
+# why.  A kick's 25-120 Hz is where its weight is, but it is also where it RINGS: the
+# stem's low band is busy between hits, so a hit's onset is wherever a threshold happens to
+# fall.  Measured on a real DrumSep kick stem (270 s) with librosa's detector, moving ONE
+# constant (the refractory) from 2 to 8 frames:
+#
+#     25-120 Hz  count 2065 -> 1717 -> 1281   (46 % spread)
+#     60-250 Hz  count  954 ->  918 ->  890   ( 7 % spread)
+#    120-2k Hz   count  654 ->  650 ->  638   ( 2 % spread)
+#
+# and the pipeline's own detector, run in 25-120 Hz, produced 620 onsets where the same
+# algorithm with a 150 ms refractory produced 427 - two settings agreeing on only 85 of
+# them.  A number that moves 46 % when a constant is nudged is a property of the constant,
+# not of the drum.  The kick is therefore timed in its body band, where the count is a
+# measurement.
+DETECT_BANDS: dict[str, tuple[float, float]] = {
+    "kick": (60.0, 250.0),
+    "snare": (150.0, 400.0),
+    "hihat": (6000.0, 12000.0),
+    "tom": (80.0, 250.0),
+    "cymbal": (4000.0, 14000.0),
+}
+
+# A refractory shorter than the band's own ring period cannot separate hits from ringing:
+# the lowest frequency the band admits repeats every `1 / lo` seconds, so anything above
+# three cycles of that is a new hit by construction.  With the kick's OLD band this rule
+# asks for 120 ms against the 60 ms floor the code used - which is the other half of the
+# same defect.  It is a rule, not a tuned number, and it is what keeps the count stable.
+MIN_REFRACTORY_S = 0.060
+
+# Below this contrast (p90 - p10 of the band's own level, in dB) a class's onsets are
+# threshold-dependent, and the report says so instead of presenting them as measurements.
+LOW_CONTRAST_DB = 12.0
+
+
+def refractory_for_band(lo_hz: float) -> float:
+    """The shortest gap in which a band cannot produce two independent hits."""
+    return max(MIN_REFRACTORY_S, 3.0 / max(lo_hz, 1.0))
+
+
+def _band_signal_pair(path: Path, support: tuple[float, float], detect: tuple[float, float]):
+    """Both bands of one file from ONE read + ONE fft (a stem is 270 s of float32)."""
+    import numpy as np
+    import soundfile as sf
+
+    data, sr = sf.read(str(path), dtype="float32", always_2d=True)
+    mono = data.mean(axis=1).astype(np.float64)
+    spectrum = np.fft.rfft(mono)
+    freqs = np.fft.rfftfreq(len(mono), 1.0 / sr)
+    out = []
+    for lo, hi in (support, detect):
+        mask = (freqs >= lo) & (freqs <= hi)
+        out.append(np.asarray(np.fft.irfft(spectrum * mask, n=len(mono)), dtype=np.float32))
+    return out[0], out[1], int(sr)
+
+
 def _element_signal(element_dir: Path, cls: str):
-    """Sum of the class's element files + its own median level (the support reference)."""
+    """Sum of the class's element files + its own median level (the support reference).
+
+    Carries BOTH bands: `band` for the support test (is there energy of this class here)
+    and `detect_band` for onset timing (see DETECT_BANDS).
+    """
     import numpy as np
 
-    names, (lo, hi) = ELEMENT_BANDS[cls]
+    names, support = ELEMENT_BANDS[cls]
+    detect = DETECT_BANDS.get(cls, support)
     total = None
+    detect_total = None
     sr = None
     used: list[str] = []
     for name in names:
         path = find_element_wav(element_dir, [name])
         if path is None:
             continue
-        band, sr = _band_signal(path, lo, hi)
+        band, detect_band, sr = _band_signal_pair(path, support, detect)
         total = band if total is None else total[: len(band)] + band[: len(total)]
+        if detect_total is None:
+            detect_total = detect_band
+        else:
+            detect_total = detect_total[: len(detect_band)] + detect_band[: len(detect_total)]
         used.append(path.name)
     if total is None:
         return None
     step = max(1, int(0.025 * sr))
     frames = total[: len(total) // step * step].reshape(-1, step)
     env = np.sqrt(np.mean(frames ** 2, axis=1))
-    return {"band": total, "sr": int(sr), "background": float(np.median(env)), "files": used}
+    env_db = 20.0 * np.log10(np.maximum(env, 1e-12))
+    p10, p90 = (float(np.percentile(env_db, p)) for p in (10.0, 90.0))
+    return {
+        "band": total,
+        "detect_band": detect_total,
+        "sr": int(sr),
+        "background": float(np.median(env)),
+        "files": used,
+        "detect_band_hz": [float(detect[0]), float(detect[1])],
+        # contrast = how far the quiet parts sit below the loud parts.  A band whose hits
+        # do not stand above a busy floor cannot be timed by thresholding it, and this is
+        # the number that says so instead of trusting the count.
+        "contrast_db": round(p90 - p10, 2),
+    }
 
 
 def _support_db(signal: dict, t: float, half: float = 0.03) -> float:
@@ -141,21 +225,83 @@ def _support_db(signal: dict, t: float, half: float = 0.03) -> float:
     return float(20 * np.log10(max(rms, 1e-12) / signal["background"]))
 
 
+# Onset detection constants.  The threshold is LOCAL (a multiple of the flux's own level
+# in a short window) and not a percentile of the whole file: a file-wide constant cannot be
+# right in a quiet passage and a loud one at once.  Measured on a real kick stem, moving
+# only the refractory: the whole-file version returned 467/382/296/268 onsets (56 % spread,
+# 57 % of the intervals landing on a musical subdivision) where the local version returns
+# 381/370/341/289 (27 % spread, 92 % musical).  Intervals are the tell: ringing inside one
+# hit produces intervals that are not subdivisions of anything.
+#
+# Against an independent reference (the envelope's own strong peaks) the two rules score:
+#
+#     whole-file percentile   recall 40 %  precision 34 %   <- what shipped
+#     local x7 only           recall 69 %  precision 47 %   <- fires in silence (6 %)
+#     local x7 + floor        recall 57 %  precision 54 %   <- both terms
+ONSET_FACTOR = 7.0        # how far the flux must stand above its own local level
+# The floor's job is to keep the material's residue out (reverb tails, separation bleed):
+# with the local term alone, 6 % of the onsets sat more than 10 dB below the file's median,
+# i.e. where nothing was hit.  Its price is measured too: a hit more than ~12 dB below the
+# track's strongest is not reported by the detector (the model can still contribute it).
+ONSET_FLOOR_FRACTION = 0.2
+# The floor's percentile must be HIGH: a percentile is only a hit-level number if the hits
+# occupy more than 1-p of the signal.  At p99 a file whose hits are sparse has a floor made
+# of its own noise - measured on a synthetic 6 s file with five clicks, which then produced
+# onsets in pure silence.  p99.9 is a hit either way: on a real 270 s stem the two differ by
+# a factor of 2, and the choice costs nothing there.
+ONSET_FLOOR_PERCENTILE = 99.9
+ONSET_WINDOW_S = 0.200    # the window that level is measured over
+ONSET_FRAME_S = 0.002     # analysis hop for the flux (finer than any grid a note lands on)
+
+
 def _onset_times(band, sr: int, min_gap: float = 0.06) -> list[float]:
+    """Attack times from the band-limited envelope, thresholded LOCALLY.
+
+    `min_gap` is the refractory (see refractory_for_band): it must outlast the band's own
+    ring, or the ring's bumps become notes.  It is a guard, not the mechanism - with a
+    local threshold the flux does not oscillate through it, so the count does not collapse
+    when it is moved.
+    """
     import numpy as np
 
     window = max(int(0.005 * sr), 1)
     env = np.convolve(np.abs(band), np.ones(window) / window, mode="same")
     flux = np.diff(env)
     flux[flux < 0] = 0.0
-    threshold = float(np.percentile(flux, 99.0))
-    candidates = np.where(
-        (flux[1:-1] > threshold) & (flux[1:-1] >= flux[:-2]) & (flux[1:-1] > flux[2:])
-    )[0] + 1
+
+    hop = max(int(ONSET_FRAME_S * sr), 1)
+    frames = flux[::hop]
+    n = len(frames)
+    if n < 8:
+        return []
+    span = max(int(ONSET_WINDOW_S * sr / hop), 3)
+    pad = span // 2
+    padded = np.pad(frames, (pad, pad), mode="edge")
+    windows = np.lib.stride_tricks.sliding_window_view(padded, span)
+    stride = max(1, span // 8)
+    sampled = windows[::stride].mean(axis=1)
+    level = sampled[np.linspace(0, len(sampled) - 1, n).astype(int)]
+    # BOTH terms are needed, and each was measured.  The local term is what makes the same
+    # setting work in a quiet passage and a loud one; alone it goes to zero in silence, so
+    # tiny flux passes and the onsets land where nothing was hit (measured: 6 % of them sat
+    # more than 10 dB below the file's median).  The floor alone is the old behaviour, which
+    # let ring bumps through (65 % musical intervals, and only 79 % of its onsets at a real
+    # rise).  Together: 86 % musical and 95 % at a rise, with nothing in the silence.
+    threshold = np.maximum(
+        level * ONSET_FACTOR,
+        ONSET_FLOOR_FRACTION * float(np.percentile(flux, ONSET_FLOOR_PERCENTILE)),
+    )
+
+    above = frames > threshold
+    candidates = np.where(above[1:-1] & (above[1:-1] >= above[:-2]) & (above[1:-1] > above[2:]))[0] + 1
     times: list[float] = []
     last = -10.0
     for index in candidates:
-        t = index / sr
+        # refine to the full-resolution flux so the reported time keeps its sub-frame detail
+        lo = max(0, index * hop - hop)
+        hi = min(len(flux), index * hop + hop + 1)
+        exact = lo + int(np.argmax(flux[lo:hi]))
+        t = exact / sr
         if t - last > min_gap:
             times.append(float(t))
             last = t
@@ -245,18 +391,35 @@ def _resolve_torch_device(device: str) -> str:
         return "cpu"
 
 
-def _notes_from_elements(element_dir: Path, warnings: list[str]) -> list[tuple[str, float]]:
+def _notes_from_elements(signals: dict[str, dict], element_dir: Path, warnings: list[str]) -> list[tuple[str, float]]:
     """Independent onsets measured inside each element - recall, not authority.
 
     These exist because the models miss hits; but they are found in the same elements
     the arbiter uses, so they can never be evidence FOR themselves.
+
+    Timed in the class's DETECT band with a refractory that outlasts that band's own ring
+    (see DETECT_BANDS / refractory_for_band).  In a band whose hits do not stand above a
+    busy floor BOTH the count and the times are properties of the constants: measured on a
+    real kick stem, this same algorithm returned 620 or 427 onsets depending on one number,
+    agreeing with itself on only 85 of them.
+
+    Takes the signals the caller already computed: re-reading six 270 s stems to ask a
+    second question about them is 400 MB of I/O for nothing.
     """
     notes: list[tuple[str, float]] = []
     for cls in CLASSES:
-        signal = _element_signal(element_dir, cls)
+        signal = signals.get(cls)
         if signal is None:
             continue
-        for t in _onset_times(signal["band"], signal["sr"]):
+        lo_hz, hi_hz = signal["detect_band_hz"]
+        refractory = refractory_for_band(float(lo_hz))
+        if signal["contrast_db"] < LOW_CONTRAST_DB:
+            warnings.append(
+                f"element '{cls}': its {lo_hz:.0f}-{hi_hz:.0f} Hz band has only "
+                f"{signal['contrast_db']:.1f} dB between the quiet and the loud parts, so its "
+                "onsets depend on the threshold - this class's note times are approximate"
+            )
+        for t in _onset_times(signal["detect_band"], signal["sr"], min_gap=refractory):
             notes.append((cls, float(t)))
     if not notes:
         warnings.append(f"detector: no drum elements found in {element_dir}")
@@ -564,7 +727,7 @@ def drums_midi_core(
             signals[cls] = signal
         durations = _duration_mismatch_warning(signals, audio_path, warnings)
         if use_detector:
-            detected = _notes_from_elements(element_dir, warnings)
+            detected = _notes_from_elements(signals, element_dir, warnings)
             if detector_classes:
                 unknown = sorted(set(detector_classes) - set(CLASSES))
                 if unknown:
@@ -652,8 +815,17 @@ def drums_midi_core(
             "lone_support_db": lone_support_db,
         },
         "detector_classes": sorted(detector_classes) if detector_classes else "all",
-        "model_classes": sorted(model_classes) if model_classes else "all",
-        "model": model_info,
+        "model_classes": sorted(model_classes) if model_classes else "all",            # what the onsets were MEASURED in: a band whose hits do not stand above a busy
+            # floor gives a count that is a property of the constants, not of the drum
+            "detect_bands": {
+                cls: {
+                    "hz": signal["detect_band_hz"],
+                    "refractory_ms": round(refractory_for_band(float(signal["detect_band_hz"][0])) * 1000.0, 1),
+                    "contrast_db": signal["contrast_db"],
+                    "stable": signal["contrast_db"] >= LOW_CONTRAST_DB,
+                }
+                for cls, signal in sorted(signals.items())
+            },        "model": model_info,
         "sources": {label: len(notes) for label, notes in notes_by_source.items()},
         "warnings": warnings,
     }

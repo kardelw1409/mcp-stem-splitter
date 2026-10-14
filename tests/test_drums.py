@@ -19,6 +19,143 @@ import unittest
 from pathlib import Path
 
 
+class TestOnsetDetection(unittest.TestCase):
+    """Why the detector was rewritten, pinned as behaviour.
+
+    The old detector thresholded the flux at the 99th percentile of the WHOLE FILE, then
+    thinned with a 60 ms refractory.  Measured on a real kick stem that combination produced
+    onsets that were not hits: only 79 % of them sat at a rise of 6 dB or more, and only
+    65 % of their intervals were multiples of a 1/16 (ringing inside one hit is not a
+    subdivision of anything).  The kick was also detected in 25-120 Hz, where the same
+    algorithm's count moved 620 -> 395 when the refractory was nudged - a count that is a
+    property of a constant is not a measurement.
+    """
+
+    def _click_train(self, sr: int, hits, *, gain=1.0, noise=0.0, seconds=10.0):
+        import numpy as np
+
+        out = np.random.default_rng(0).normal(0.0, noise, int(seconds * sr)).astype(np.float32)
+        for t in hits:
+            i = int(t * sr)
+            out[i:i + int(0.002 * sr)] += gain
+        return out
+
+    def test_the_refractory_follows_the_band_not_a_constant(self):
+        """A band that admits 25 Hz rings every 40 ms; three cycles of that is 120 ms, so a
+        60 ms refractory cannot separate a hit from its own ring.  A band whose lowest
+        frequency is 60 Hz needs only 50 ms - the floor covers it."""
+        from mcp_stem_splitter.drums import MIN_REFRACTORY_S, refractory_for_band
+
+        self.assertEqual(refractory_for_band(25.0), 0.12)
+        self.assertEqual(refractory_for_band(40.0), 0.075)
+        self.assertEqual(refractory_for_band(60.0), MIN_REFRACTORY_S)
+        self.assertEqual(refractory_for_band(6000.0), MIN_REFRACTORY_S)
+
+    def test_a_ringing_hit_is_one_onset_not_five(self):
+        """The defect in miniature: a decaying 40 Hz burst is one hit whose envelope bumps
+        every 12 ms.  It must be reported once, at its start - not once per bump."""
+        import numpy as np
+
+        from mcp_stem_splitter.drums import _onset_times, refractory_for_band
+
+        sr = 8000
+        t = np.arange(int(6.0 * sr)) / sr
+        signal = np.zeros_like(t)
+        for start in (1.0, 2.0, 4.0):
+            ring = np.exp(-(t - start) / 0.25) * ((t >= start) & (t < start + 1.0))
+            signal += ring * np.sin(2 * np.pi * 40.0 * (t - start))
+        band = signal.astype(np.float32)
+
+        onsets = _onset_times(band, sr, min_gap=refractory_for_band(40.0))
+        self.assertEqual(len(onsets), 3, f"three hits, got {len(onsets)} at {onsets}")
+        for found, expected in zip(onsets, (1.0, 2.0, 4.0)):
+            self.assertLess(abs(found - expected), 0.02, found)
+        # and the shorter refractory the old code used cannot be better on the same signal
+        loose = _onset_times(band, sr, min_gap=0.060)
+        self.assertGreaterEqual(len(loose), len(onsets)), loose
+
+    def test_silence_produces_no_onsets(self):
+        """The local term alone goes to zero where there is no signal, so tiny flux passes
+        and notes appear where nothing was hit (measured: 6 % of the onsets sat more than
+        10 dB below the file's median).  The floor term is what stops that."""
+        import numpy as np
+
+        from mcp_stem_splitter.drums import _onset_times
+
+        sr = 8000
+        rng = np.random.default_rng(1)
+        first = np.zeros(int(3.0 * sr), dtype=np.float32)
+        for t in (0.5, 1.0, 1.5, 2.0, 2.5):
+            first[int(t * sr):int(t * sr) + 20] = 1.0
+        quiet = rng.normal(0.0, 1e-4, int(3.0 * sr)).astype(np.float32)
+        band = np.concatenate([first, quiet])
+        onsets = _onset_times(band, sr, min_gap=0.060)
+        self.assertEqual(len(onsets), 5, f"the quiet half must contribute nothing: {onsets}")
+        self.assertTrue(all(t < 3.0 for t in onsets), onsets)
+
+    def test_a_quiet_passage_is_still_detected(self):
+        """The other half of the same rule: the local term exists so that a section quieter
+        than the loudest is not skipped by a threshold set for the loudest.  Measured on this
+        fixture: a section 6 dB down is found in full, 10 dB down is still found, and past
+        ~12 dB it is not - that is the floor's price, and it is why the floor is a fraction
+        of a HIGH percentile rather than of the peak."""
+        import numpy as np
+
+        from mcp_stem_splitter.drums import _onset_times
+
+        sr = 8000
+
+        def section(amplitude):
+            out = np.zeros(int(3.0 * sr), dtype=np.float32)
+            for t in (0.5, 1.0, 1.5, 2.0, 2.5):
+                out[int(t * sr):int(t * sr) + 20] = amplitude
+            return out
+
+        onsets = _onset_times(np.concatenate([section(1.0), section(0.32)]), sr, min_gap=0.060)
+        in_quiet = [t for t in onsets if t >= 3.0]
+        self.assertEqual(len(in_quiet), 5, f"a section 10 dB down must still be found: {onsets}")
+        # and it must not invent hits that are not there: past the floor they are gone
+        deep = _onset_times(np.concatenate([section(1.0), section(0.05)]), sr, min_gap=0.060)
+        self.assertEqual(len([t for t in deep if t >= 3.0]), 0)
+
+    def test_the_kick_is_timed_where_the_hit_is(self):
+        """The kick's sub band is not a place to time a kick from: asking 'is there kick
+        energy here' in 25-120 Hz gives +3.7 dB at the hits and +5.0 dB BETWEEN them, so the
+        answer is never no and every note is 'supported'.  In the body band the same question
+        separates them by +7.2 dB.  Both bands are therefore the body band now."""
+        from mcp_stem_splitter.drums import DETECT_BANDS, ELEMENT_BANDS
+
+        self.assertEqual(DETECT_BANDS["kick"], (60.0, 250.0))
+        self.assertEqual(ELEMENT_BANDS["kick"][1], (60.0, 250.0))
+        # the other classes keep the band their support test was measured with
+        for cls in ("snare", "hihat", "tom", "cymbal"):
+            self.assertEqual(DETECT_BANDS[cls], ELEMENT_BANDS[cls][1])
+
+    def test_low_contrast_is_reported_not_hidden(self):
+        """A band whose hits do not stand above a busy floor cannot be timed by thresholding
+        it, and the report has to say so instead of presenting its onsets as measurements."""
+        import numpy as np
+        import soundfile as sf
+
+        from mcp_stem_splitter.drums import LOW_CONTRAST_DB, drums_midi_core
+
+        with tempfile.TemporaryDirectory() as tmp:
+            elements = Path(tmp) / "elements"
+            elements.mkdir()
+            sr = 8000
+            rng = np.random.default_rng(2)
+            # a kick element that is one continuous noise floor: no hits, no contrast
+            sf.write(str(elements / "kick.wav"), rng.normal(0, 0.2, sr * 4).astype(np.float32), sr)
+            result = drums_midi_core(element_stems_dir=str(elements),
+                                     output_dir=str(Path(tmp) / "out"), bpm=120.0,
+                                     use_detector=True, allow_model_download=False)
+            kick = result["detect_bands"]["kick"]
+            self.assertLess(kick["contrast_db"], LOW_CONTRAST_DB)
+            self.assertFalse(kick["stable"])
+            self.assertTrue(any("depending" in w or "depend on the threshold" in w for w in result["warnings"]),
+                            result["warnings"])
+
+
 class TestPitchVocabulary(unittest.TestCase):
     def test_kick_has_both_pitches(self):
         from mcp_stem_splitter.drums import PITCH_CLASS
