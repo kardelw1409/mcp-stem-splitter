@@ -18,3 +18,51 @@ Tools:
 - `get_presets()` -> `{ presets: [...] }`
 - `split_stems(input_path, output_dir, ...)` -> `{ stems: { drums,bass,vocals,other } }`
 - `split_vocals_only(input_path, output_dir, ...)` -> `{ stems: { vocals,instrumental } }`
+- `drums_midi(...)` -> drum MIDI, one file per drum class (see below)
+
+## Drums MIDI (`drums_midi`)
+
+Builds a drum MIDI part for a track, optionally split into one file per drum class so a
+DAW can place kick / snare / hi-hats / toms / cymbals as **separate items**.
+
+```python
+drums_midi(
+    audio_path=r"...\mix.wav",              # a transcription source (ADTOF)
+    element_stems_dir=r"...\drumsep_out",   # kick/snare/hh/toms/ride/crash stems
+    extra_midi=[r"...\adtstr.mid"],         # any number of extra sources
+    output_dir=r"...\drums_midi",
+    bpm=172.0,                              # measured tempo; omit to skip quantisation
+    grid_origin_s=0.031,                    # measured grid phase (from the manifest)
+    mode="balanced",
+)
+```
+
+Returns `{ midi: { combined, by_class: {kick, snare, hihat, tom, cymbal} }, notes, velocity, grid, arbiter, sources, warnings }`.
+
+Why more than one model:
+
+* a single model's notes are only about half supported by the audio (measured),
+* even four models agreeing leave ~a quarter of notes unsupported - they share a bias,
+* the separated drum elements are the only physical ground truth available, and they
+  are independent of every model.
+
+So every note must be **proposed by a source** and **supported by the matching element**
+(louder than that element's own median level - a self-calibrating test, no invented
+threshold). Modes trade precision for recall:
+
+| mode | keeps |
+| --- | --- |
+| `consensus` | any 2+ sources agree (no physical check) |
+| `strict` | 2+ agree **and** the element supports it |
+| `balanced` (default) | as strict, or a lone source that is clearly above the element level |
+| `full` | anything the element supports (recall first) |
+
+Velocity is set **per class**, because the models are not equally good at it: kick is
+flat (its model velocity correlates +0.09 with the audio - a kick is a sample trigger),
+snare/hi-hat get measured dynamics (correlations +0.65 / +0.45), toms and cymbals a
+compressed range.
+
+`element_stems_dir` must contain the separated elements (e.g. `kick.wav`, `snare.wav`,
+`hh.wav`, `toms.wav`, `ride.wav`, `crash.wav` - the `drumsep_(kick)_....wav` naming is
+also recognised). Without it, notes fall back to source agreement only and the report
+says `support_db: null` rather than pretending they were verified.

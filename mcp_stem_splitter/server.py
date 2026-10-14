@@ -447,6 +447,39 @@ def split_vocals_only_core(
     }
 
 
+@mcp.tool("drums_midi")
+def drums_midi(
+    audio_path: str | None = None,
+    output_dir: str = "drums_midi",
+    element_stems_dir: str | None = None,
+    extra_midi: list[str] | None = None,
+    bpm: float | None = None,
+    grid_origin_s: float | None = None,
+    mode: str = "balanced",
+    quantize_to_grid: bool = True,
+    max_shift_ms: float = 60.0,
+    split_by_class: bool = True,
+    use_detector: bool = True,
+    device: str = "auto",
+) -> dict[str, Any]:
+    from .drums import drums_midi_core
+
+    return drums_midi_core(
+        audio_path=audio_path,
+        output_dir=output_dir,
+        element_stems_dir=element_stems_dir,
+        extra_midi=extra_midi,
+        bpm=bpm,
+        grid_origin_s=grid_origin_s,
+        mode=mode,
+        quantize_to_grid=quantize_to_grid,
+        max_shift_ms=max_shift_ms,
+        split_by_class=split_by_class,
+        use_detector=use_detector,
+        device=device,
+    )
+
+
 def run() -> None:
     _configure_logging()
     mcp.run()
