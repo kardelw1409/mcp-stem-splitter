@@ -4,7 +4,10 @@ version = "0.1.0"
 description = "MCP server for stem splitting (drums/bass/vocals/other) using headless separation."
 requires-python = ">=3.11"
 dependencies = [
-  "mcp>=1.0.0",
+  # <2 is a real bound, not tidiness: mcp 2.x renamed FastMCP to MCPServer and changed the
+  # decorator/run API, so "mcp>=1.0.0" alone installs a version this server cannot even
+  # import (measured: pip resolves 2.3.0 and "from mcp.server.fastmcp import FastMCP" raises).
+  "mcp>=1.0.0,<2",
   "demucs>=4.0.0",
   "soundfile>=0.12.1",
   "torch",

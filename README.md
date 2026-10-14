@@ -119,3 +119,81 @@ which is the JSON-RPC channel, so the library's output is redirected to stderr.
 The result's `model` field records the exact file, where it came from (`vendored`,
 `env`, `cache`, `downloaded`), its digest, the `device` used and the thresholds in
 force - report those instead of assuming the model loaded.
+
+## Installing on another machine
+
+Nothing in this repository points at a path on the machine it was written on. A fresh copy is
+self-sufficient for `drums_midi`:
+
+```powershell
+git clone https://github.com/kardelw1409/mcp-stem-splitter.git
+cd mcp-stem-splitter
+py -3.11 -m venv .venv
+.venv\Scripts\python.exe -m pip install -e .
+```
+
+For GPU, install a CUDA build of PyTorch **before** that last line, so pip does not resolve a CPU
+one first (`device="auto"` then picks CUDA, and the result's `model.device` says which was used):
+
+```powershell
+.venv\Scripts\python.exe -m pip install torch --index-url https://download.pytorch.org/whl/cu128
+```
+
+Then point the MCP entry at that venv's `python.exe` - in the *consuming* workspace's
+`.vscode/mcp.json` (this repository has no `.vscode/`, it is git-ignored):
+
+```json
+{
+  "servers": {
+    "stem_splitter": {
+      "type": "stdio",
+      "command": "C:\\path\\to\\mcp-stem-splitter\\.venv\\Scripts\\python.exe",
+      "cwd": "C:\\path\\to\\mcp-stem-splitter",
+      "args": ["-m", "mcp_stem_splitter"]
+    }
+  }
+}
+```
+
+An already-running MCP server keeps the tool list it started with, so after changing tool
+descriptions or adding a tool, restart the server (or reload the window) before expecting to see it.
+
+### What comes with the clone, and what fetches itself
+
+| asset | size | how it arrives |
+| --- | --- | --- |
+| ADTOF code + weights (`drums_midi`) | 3.5 MB | **inside the package** - already in the clone |
+| Demucs weights (`split_stems`) | 48-160 MB per model | Demucs downloads them on first use into `%USERPROFILE%\.cache\torch\hub\checkpoints` |
+| DrumSep checkpoint (the `element_stems_dir` source) | 417 MB | downloaded by `audio-separator`; needed only for per-element arbitration |
+| ADTOF weights, if a slim install dropped them | 3.5 MB | one fetch into `%LOCALAPPDATA%\mcp-stem-splitter`, reused after that; `allow_model_download=False` refuses it |
+
+A clone of the whole repository is small: measured at `.git` 1.94 MB plus a 3.56 MB working tree
+(18 files), with no virtualenv and no model caches in it - those are machine-local and are built by
+`pip` and by the tools themselves.
+
+`requirements.lock.txt` is the exact `pip freeze` of the venv these numbers were measured in, for
+when a bug has to be reproduced rather than a tool used. Three things in it are worth knowing
+before copying it verbatim:
+
+* `mcp<2` is a **hard requirement**, not tidiness. mcp 2.x renamed `FastMCP` to `MCPServer` and
+  changed the decorator/run API, so `mcp>=1.0.0` resolved 2.3.0 on a clean venv and the server
+  could not even be imported (`No module named 'mcp.server.fastmcp'`). `pyproject.toml` pins it.
+* its `torch` is a **nightly** (`2.11.0.dev20260118+cu128`) - nightly builds are pruned from the
+  index, so that exact pin stops being installable; use a current nightly or a stable release,
+* it also contains packages that belong to other experiments and are not needed here:
+  `tensorflow` / `tensorflow-intel` (pulled in by `basic-pitch`), `torchaudio`, `torchcodec`.
+  This matters, because **tensorflow is what holds `numpy` at 1.23.5 and `scipy` at 1.10.1** in
+  that venv - `onnx` once pulled numpy 2 and broke both (`_ARRAY_API not found`).
+
+The two `-e git+...` entries that a `pip freeze` of that venv does list are deliberately excluded:
+the project itself (install it from your checkout) and the old ADTOF clone, which is obsolete now
+that its four modules and its weights ship inside the package.
+
+This is not theoretical - it was measured on a clean venv built exactly as above (Python 3.11.9,
+`pip install .`, no other packages): pip resolved `mcp 2.3.0` and the server did not import (that is
+what the pin fixes); with the pin it resolved `mcp 1.30.0`, listed all five tools, passed 32/32 of
+the package's own tests and produced a real transcription of the 90 s drum & bass excerpt - 707
+notes, `weights_source: vendored`, `device: cpu` (auto-selected, since that torch was CPU-only),
+`numpy 2.4.6`, `scipy 1.17.1`, `torch 2.14.1+cpu`. So the tools run on a modern stack; the old
+pins in `requirements.lock.txt` are the constraint of the machine this venv lives on, not of the
+code.
